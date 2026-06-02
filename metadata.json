@@ -1,0 +1,8 @@
+{
+  "name": "AI Usage Limits",
+  "uuid": "ai-usage@serboox.github.io",
+  "description": "Shows AI service usage limits in the panel. Currently supports Claude; Codex and Gemini support planned.",
+  "version": 1,
+  "url": "https://github.com/serboox/gnome-ai-usage",
+  "shell-version": ["45", "46", "47", "48", "49"]
+}
