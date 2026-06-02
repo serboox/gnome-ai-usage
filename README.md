@@ -2,7 +2,7 @@
 
 A GNOME Shell extension that shows AI service usage limits in the panel, left of the clock. Currently supports Claude; Codex and Gemini support planned.
 
-![Panel preview: ✳ ▓▓▓▓░░░░ 28% · 2h25m · 78% · 6h0m](https://raw.githubusercontent.com/serboox/gnome-ai-usage/main/icons/claude.svg)
+![AI Usage Limits — panel widget and popup showing current session and weekly usage](https://raw.githubusercontent.com/serboox/gnome-ai-usage/main/preview.png)
 
 ## Features
 
