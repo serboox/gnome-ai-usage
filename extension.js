@@ -35,10 +35,73 @@ function fmt(val) {
     return (val === null || val === undefined) ? '—' : `${Math.round(val)}%`;
 }
 
+function titleCase(s) {
+    return String(s ?? '')
+        .replace(/[_-]+/g, ' ')
+        .replace(/\b\w/g, (c) => c.toUpperCase())
+        .trim();
+}
+
+function limitLabel(item) {
+    const model = item?.scope?.model?.display_name;
+    if (item?.group === 'session') return 'Current session';
+    if (item?.kind === 'weekly_all' || (item?.group === 'weekly' && !item?.scope))
+        return 'All models';
+    if (model) return `${model} only`;
+    if (item?.kind) return titleCase(item.kind);
+    return item?.scope ? 'Scoped' : 'Usage';
+}
+
+// Section heading for a limit group. Known groups keep their curated labels;
+// any future group falls back to a title-cased "<Group> limits".
+function sectionHeading(group) {
+    if (group === 'session') return 'Current session';
+    if (group === 'weekly')  return 'Weekly limits';
+    const t = titleCase(group);
+    return /limits?$/i.test(t) ? t : `${t} limits`;
+}
+
+// Normalize any usage payload into a flat list of limit descriptors.
+// Prefers the server-driven `limits[]` array so new/removed models need no
+// code change; falls back to the legacy named keys for older files.
+function normalizeLimits(data) {
+    if (!data) return [];
+
+    if (Array.isArray(data.limits) && data.limits.length > 0) {
+        return data.limits.map((item) => ({
+            group:     item?.group ?? 'other',
+            label:     limitLabel(item),
+            percent:   Number.isFinite(item?.percent) ? item.percent : null,
+            resets_at: item?.resets_at ?? null,
+            severity:  item?.severity ?? 'normal',
+            scoped:    Boolean(item?.scope),
+        }));
+    }
+
+    const out = [];
+    const push = (obj, group, labelText, scoped) => {
+        if (!obj) return;
+        out.push({
+            group,
+            label:     labelText,
+            percent:   Number.isFinite(obj.utilization) ? obj.utilization : null,
+            resets_at: obj.resets_at ?? null,
+            severity:  'normal',
+            scoped,
+        });
+    };
+    push(data.five_hour,        'session', 'Current session', false);
+    push(data.seven_day,        'weekly',  'All models',       false);
+    push(data.seven_day_sonnet, 'weekly',  'Sonnet only',      true);
+    push(data.seven_day_opus,   'weekly',  'Opus only',        true);
+    return out;
+}
+
 // "2mo5d" / "1d6h" / "3h54m" / "42m" / "↺" for panel chip
 function compactUntil(iso) {
     if (!iso) return '';
     const ms = new Date(iso) - new Date();
+    if (!Number.isFinite(ms)) return '';
     if (ms <= 0) return '↺';
     const totalMin = Math.floor(ms / 60_000);
     const totalH   = Math.floor(totalMin / 60);
@@ -61,6 +124,7 @@ function compactUntil(iso) {
 function humanUntil(iso) {
     if (!iso) return '';
     const ms = new Date(iso) - new Date();
+    if (!Number.isFinite(ms)) return '';
     if (ms <= 0) return 'resetting soon';
     const totalMin = Math.floor(ms / 60_000);
     const totalH   = Math.floor(totalMin / 60);
@@ -77,6 +141,31 @@ function humanUntil(iso) {
     const h = totalH;
     const m = totalMin % 60;
     return h > 0 ? `Resets in ${h} hr ${m} min` : `Resets in ${m} min`;
+}
+
+// "12:29" when the reset is later today, else "Jul 6, 17:00" — local time
+function resetClock(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (isNaN(d)) return '';
+    const now = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    const sameDay = d.getFullYear() === now.getFullYear()
+        && d.getMonth() === now.getMonth()
+        && d.getDate() === now.getDate();
+    if (sameDay) return hhmm;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
+}
+
+// "Resets in 3 hr 54 min (12:29)" for popup rows; empty when resets_at is absent
+function resetInfo(iso) {
+    if (!iso || isNaN(new Date(iso))) return '';
+    const until = humanUntil(iso);
+    const clock = resetClock(iso);
+    return clock ? `${until} (${clock})` : until;
 }
 
 function timeAgo(date) {
@@ -209,9 +298,12 @@ function vbox(style = '') {
 //   [Title            ]  [======-------]  X% used
 //   [Resets in X hr Y ]
 function progressRow(title, subtitle, pct, rightText) {
-    const color       = barColor(pct);
-    const safe        = Math.min(100, Math.max(0, pct));
-    const displayText = rightText !== undefined ? rightText : `${Math.round(pct)}% used`;
+    const hasPct      = Number.isFinite(pct);
+    const safe        = hasPct ? Math.min(100, Math.max(0, pct)) : 0;
+    const color       = barColor(safe);
+    const displayText = rightText !== undefined
+        ? rightText
+        : (hasPct ? `${Math.round(pct)}% used` : '—');
 
     const root = hbox('margin-bottom: 22px; spacing: 16px;');
 
@@ -333,10 +425,14 @@ export default class AiUsageExtension extends Extension {
             return;
         }
 
-        const session = this._data.five_hour?.utilization ?? 0;
-        const weekly  = this._data.seven_day?.utilization ?? 0;
-        const safe    = Math.min(100, Math.max(0, session));
-        const color   = barColor(session);
+        const limits       = normalizeLimits(this._data);
+        const sessionItem  = limits.find((l) => l.group === 'session');
+        const allModels    = limits.find((l) => l.group === 'weekly' && !l.scoped);
+
+        const session = sessionItem?.percent ?? null;
+        const weekly  = allModels?.percent ?? null;
+        const safe    = Math.min(100, Math.max(0, session ?? 0));
+        const color   = barColor(session ?? 0);
 
         this._panelBar._pct   = safe;
         this._panelBar._color = color;
@@ -345,14 +441,14 @@ export default class AiUsageExtension extends Extension {
         this._sessionLabel.set_text(fmt(session));
         this._sessionLabel.set_style(`font-size: 14px; color: ${color};`);
 
-        const t = compactUntil(this._data.five_hour?.resets_at);
+        const t = compactUntil(sessionItem?.resets_at);
         this._timeLabel.set_text(t ? `· ${t} ·` : '·');
         this._timeLabel.set_style('font-size: 13px; color: #aaaaaa;');
 
-        this._weeklyLabel.set_text(fmt(weekly));
-        this._weeklyLabel.set_style(`font-size: 14px; color: ${barColor(weekly)};`);
+        this._weeklyLabel.set_text(allModels ? fmt(weekly) : '');
+        this._weeklyLabel.set_style(`font-size: 14px; color: ${barColor(weekly ?? 0)};`);
 
-        const tw = compactUntil(this._data.seven_day?.resets_at);
+        const tw = compactUntil(allModels?.resets_at);
         this._weeklyTimeLabel.set_text(tw ? `· ${tw}` : '');
         this._weeklyTimeLabel.set_style('font-size: 13px; color: #aaaaaa;');
     }
@@ -377,29 +473,40 @@ export default class AiUsageExtension extends Extension {
             root.add_child(label('No data yet — waiting for fetch-usage.sh',
                 'font-size: 13px; color: #aaaaaa;'));
         } else {
-            // ── Current session ───────────────────────────────────────────
-            root.add_child(progressRow(
-                'Current session',
-                humanUntil(d.five_hour?.resets_at),
-                d.five_hour?.utilization ?? 0,
-            ));
+            const limits = normalizeLimits(d);
 
-            // ── Weekly limits ─────────────────────────────────────────────
-            root.add_child(label('Weekly limits',
-                'font-size: 16px; font-weight: bold; color: #ffffff; margin-bottom: 18px; margin-top: 6px;'));
+            // Group descriptors by `group`, preserving first-seen order,
+            // then float the session group to the top.
+            const byGroup = new Map();
+            for (const item of limits) {
+                const g = item.group ?? 'other';
+                if (!byGroup.has(g)) byGroup.set(g, []);
+                byGroup.get(g).push(item);
+            }
+            const seen = [...byGroup.keys()];
+            const orderedGroups = [
+                ...seen.filter((g) => g === 'session'),
+                ...seen.filter((g) => g !== 'session'),
+            ];
 
-            root.add_child(progressRow(
-                'All models',
-                humanUntil(d.seven_day?.resets_at),
-                d.seven_day?.utilization ?? 0,
-            ));
+            // The session group keeps its headingless style (its row is already
+            // titled "Current session"); every other group gets a section heading.
+            for (const g of orderedGroups) {
+                const items = byGroup.get(g);
+                if (!items || items.length === 0) continue;
 
-            if (d.seven_day_sonnet) {
-                root.add_child(progressRow(
-                    'Sonnet only',
-                    humanUntil(d.seven_day_sonnet?.resets_at),
-                    d.seven_day_sonnet?.utilization ?? 0,
-                ));
+                if (g !== 'session') {
+                    root.add_child(label(sectionHeading(g),
+                        'font-size: 16px; font-weight: bold; color: #ffffff; margin-bottom: 18px; margin-top: 6px;'));
+                }
+
+                for (const item of items) {
+                    root.add_child(progressRow(
+                        item.label,
+                        resetInfo(item.resets_at),
+                        item.percent,
+                    ));
+                }
             }
 
             // ── Footer ────────────────────────────────────────────────────
@@ -459,6 +566,7 @@ export default class AiUsageExtension extends Extension {
             const proc = Gio.Subprocess.new(['/bin/bash', FETCH_SCRIPT], Gio.SubprocessFlags.NONE);
             proc.wait_async(null, (source, result) => {
                 try { source.wait_finish(result); } catch (_) {}
+                if (!this._panelBar) return;
                 this._refresh();
                 if (this._tray?.menu?.isOpen) this._buildPopup();
             });
