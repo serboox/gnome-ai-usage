@@ -70,6 +70,7 @@ function normalizeLimits(data) {
     if (Array.isArray(data.limits) && data.limits.length > 0) {
         return data.limits.map((item) => ({
             group:     item?.group ?? 'other',
+            kind:      item?.kind ?? null,
             label:     limitLabel(item),
             percent:   Number.isFinite(item?.percent) ? item.percent : null,
             resets_at: item?.resets_at ?? null,
@@ -79,10 +80,11 @@ function normalizeLimits(data) {
     }
 
     const out = [];
-    const push = (obj, group, labelText, scoped) => {
+    const push = (obj, group, kind, labelText, scoped) => {
         if (!obj) return;
         out.push({
             group,
+            kind,
             label:     labelText,
             percent:   Number.isFinite(obj.utilization) ? obj.utilization : null,
             resets_at: obj.resets_at ?? null,
@@ -90,10 +92,10 @@ function normalizeLimits(data) {
             scoped,
         });
     };
-    push(data.five_hour,        'session', 'Current session', false);
-    push(data.seven_day,        'weekly',  'All models',       false);
-    push(data.seven_day_sonnet, 'weekly',  'Sonnet only',      true);
-    push(data.seven_day_opus,   'weekly',  'Opus only',        true);
+    push(data.five_hour,        'session', 'five_hour',        'Current session', false);
+    push(data.seven_day,        'weekly',  'seven_day',        'All models',       false);
+    push(data.seven_day_sonnet, 'weekly',  'seven_day_sonnet', 'Sonnet only',      true);
+    push(data.seven_day_opus,   'weekly',  'seven_day_opus',   'Opus only',        true);
     return out;
 }
 
@@ -120,52 +122,159 @@ function compactUntil(iso) {
     return h > 0 ? `${h}h${m}m` : `${m}m`;
 }
 
-// "Resets in 2 mo 5 d" / "Resets in 1 d 6 hr" / "Resets in 3 hr 54 min" / "Resets in 42 min" for popup
+// "2 mo 5 d" / "1 d 6 hr" / "3 hr 54 min" / "42 min"
+function formatDurationMin(totalMin) {
+    const safeMin = Math.max(0, totalMin);
+    const totalH  = Math.floor(safeMin / 60);
+    const totalD  = Math.floor(totalH / 24);
+    if (totalD >= 30) {
+        const mo = Math.floor(totalD / 30);
+        const rd = totalD % 30;
+        return rd > 0 ? `${mo} mo ${rd} d` : `${mo} mo`;
+    }
+    if (totalD >= 1) {
+        const rh = totalH % 24;
+        return rh > 0 ? `${totalD} d ${rh} hr` : `${totalD} d`;
+    }
+    const h = totalH;
+    const m = safeMin % 60;
+    return h > 0 ? `${h} hr ${m} min` : `${m} min`;
+}
+
+// "Resets in 2 mo 5 d" / "Resets in 1 d 6 hr" / "Resets in 3 hr 54 min" / "Resets in 42 min"
 function humanUntil(iso) {
     if (!iso) return '';
     const ms = new Date(iso) - new Date();
     if (!Number.isFinite(ms)) return '';
     if (ms <= 0) return 'resetting soon';
     const totalMin = Math.floor(ms / 60_000);
-    const totalH   = Math.floor(totalMin / 60);
-    const totalD   = Math.floor(totalH / 24);
-    if (totalD >= 30) {
-        const mo = Math.floor(totalD / 30);
-        const rd = totalD % 30;
-        return rd > 0 ? `Resets in ${mo} mo ${rd} d` : `Resets in ${mo} mo`;
-    }
-    if (totalD >= 1) {
-        const rh = totalH % 24;
-        return rh > 0 ? `Resets in ${totalD} d ${rh} hr` : `Resets in ${totalD} d`;
-    }
-    const h = totalH;
-    const m = totalMin % 60;
-    return h > 0 ? `Resets in ${h} hr ${m} min` : `Resets in ${m} min`;
+    return `Resets in ${formatDurationMin(totalMin)}`;
 }
 
-// "12:29" when the reset is later today, else "Jul 6, 17:00" — local time
-function resetClock(iso) {
-    if (!iso) return '';
-    const d = new Date(iso);
-    if (isNaN(d)) return '';
-    const now = new Date();
-    const pad = (n) => String(n).padStart(2, '0');
-    const hhmm = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-    const sameDay = d.getFullYear() === now.getFullYear()
-        && d.getMonth() === now.getMonth()
-        && d.getDate() === now.getDate();
-    if (sameDay) return hhmm;
-    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-    return `${months[d.getMonth()]} ${d.getDate()}, ${hhmm}`;
+// ── burn-rate projection ─────────────────────────────────────────────────────
+
+const HISTORY_WINDOW_MIN  = 20;   // recent-rate lookback
+const HISTORY_MAX_SAMPLES = 2000; // per-limit cap
+const HISTORY_MAX_AGE_MS  = 8 * 24 * 60 * 60 * 1000;
+const ROLLOVER_DROP_PCT   = 15;   // a drop this large means a new period started
+
+// Stable id for a descriptor so its samples accumulate across polls.
+function historyKey(item) {
+    if (item.group === 'session') return 'session';
+    if (item.group === 'weekly')
+        return item.scoped ? `weekly:scoped:${item.label}` : 'weekly:all';
+    return `${item.group}:${item.kind ?? item.label}`;
 }
 
-// "Resets in 3 hr 54 min (12:29)" for popup rows; empty when resets_at is absent
-function resetInfo(iso) {
-    if (!iso || isNaN(new Date(iso))) return '';
-    const until = humanUntil(iso);
-    const clock = resetClock(iso);
-    return clock ? `${until} (${clock})` : until;
+// Append a sample for `key`, starting a fresh bucket whenever the period
+// clearly rolled over (percent dropped sharply, or resets_at moved).
+function recordSample(history, key, percent, resetsAt, now) {
+    let bucket = history.get(key);
+    if (!bucket) {
+        bucket = [];
+        history.set(key, bucket);
+    }
+
+    const last = bucket[bucket.length - 1];
+    const rolledOver = last && (
+        percent < last.percent - ROLLOVER_DROP_PCT ||
+        (resetsAt != null && last.resets_at != null && resetsAt !== last.resets_at)
+    );
+    if (rolledOver) bucket.length = 0;
+
+    bucket.push({ t: now, percent, resets_at: resetsAt });
+
+    const cutoff = now - HISTORY_MAX_AGE_MS;
+    while (bucket.length && bucket[0].t < cutoff) bucket.shift();
+    while (bucket.length > HISTORY_MAX_SAMPLES) bucket.shift();
+}
+
+// Percentage-points-per-minute over the whole recorded period, and over just
+// the last HISTORY_WINDOW_MIN minutes (the more responsive of the two).
+function computeRates(history) {
+    if (!Array.isArray(history) || history.length < 2)
+        return { recentRatePerMin: null, periodRatePerMin: null };
+
+    const first = history[0];
+    const last  = history[history.length - 1];
+    const periodSpanMin = (last.t - first.t) / 60_000;
+    const periodRatePerMin = periodSpanMin > 0
+        ? (last.percent - first.percent) / periodSpanMin
+        : null;
+
+    const windowStart   = last.t - HISTORY_WINDOW_MIN * 60_000;
+    const windowSamples = history.filter((s) => s.t >= windowStart);
+    let recentRatePerMin = null;
+    if (windowSamples.length >= 2) {
+        const spanMin = (last.t - windowSamples[0].t) / 60_000;
+        if (spanMin >= 2)
+            recentRatePerMin = (last.percent - windowSamples[0].percent) / spanMin;
+    }
+
+    return { recentRatePerMin, periodRatePerMin };
+}
+
+function projectMinutesToExhaustion(percent, ratePerMin) {
+    if (!Number.isFinite(ratePerMin) || ratePerMin <= 0) return Infinity;
+    return Math.max(0, (100 - percent) / ratePerMin);
+}
+
+// "Will run out in 55 min (speeding up)" / "On pace — lasts until reset" /
+// "Steady — should last until reset" / "Gathering usage data…"
+function burnRateMessage(item, history) {
+    if (!Number.isFinite(item?.percent)) return 'Gathering usage data…';
+
+    const { recentRatePerMin, periodRatePerMin } = computeRates(history);
+    const effectiveRate = recentRatePerMin ?? periodRatePerMin ?? null;
+    if (effectiveRate === null) return 'Gathering usage data…';
+
+    const minsToExhaust = projectMinutesToExhaustion(item.percent, effectiveRate);
+
+    let minsToReset = null;
+    if (item.resets_at) {
+        const ms = new Date(item.resets_at) - new Date();
+        if (Number.isFinite(ms)) minsToReset = ms / 60_000;
+    }
+
+    let message;
+    if (minsToExhaust === Infinity) {
+        message = minsToReset !== null ? 'Steady — should last until reset' : 'Steady pace';
+    } else if (minsToReset !== null && minsToExhaust >= minsToReset) {
+        message = 'On pace — lasts until reset';
+    } else {
+        message = `Will run out in ${formatDurationMin(Math.round(minsToExhaust))}`;
+    }
+
+    if (recentRatePerMin != null && periodRatePerMin != null && periodRatePerMin > 0) {
+        const ratio = recentRatePerMin / periodRatePerMin;
+        if (ratio > 1.25) message += ' (speeding up)';
+        else if (ratio < 0.75) message += ' (slowing down)';
+    }
+
+    return message;
+}
+
+// Convert a minor-unit integer amount (cents) into a "$708.71"-style string.
+function formatMoney(amountMinor, exponent, currency) {
+    if (!Number.isFinite(amountMinor)) return null;
+    const exp    = Number.isFinite(exponent) ? exponent : 2;
+    const amount = amountMinor / Math.pow(10, exp);
+    const symbol = (currency ?? 'USD') === 'USD' ? '$' : `${currency ?? ''} `;
+    return `${symbol}${amount.toFixed(exp)}`;
+}
+
+// Prefer the structured `spend.used` block; fall back to the legacy
+// `extra_usage.used_credits` field (both are minor-unit amounts, e.g. cents).
+function spentAmountText(d) {
+    const spendUsed = d?.spend?.used;
+    if (spendUsed && Number.isFinite(spendUsed.amount_minor))
+        return formatMoney(spendUsed.amount_minor, spendUsed.exponent, spendUsed.currency);
+
+    const extra = d?.extra_usage;
+    if (extra && Number.isFinite(extra.used_credits))
+        return formatMoney(extra.used_credits, extra.decimal_places, extra.currency);
+
+    return null;
 }
 
 function timeAgo(date) {
@@ -334,6 +443,7 @@ export default class AiUsageExtension extends Extension {
         this._timer     = null;
         this._data      = null;
         this._fetchedAt = null;
+        this._history   = new Map();
 
         // Panel button — mirrors system-monitor-next pattern:
         // add to panel first, then attach children
@@ -425,7 +535,13 @@ export default class AiUsageExtension extends Extension {
             return;
         }
 
-        const limits       = normalizeLimits(this._data);
+        const limits = normalizeLimits(this._data);
+        const now    = Date.now();
+        for (const item of limits) {
+            if (Number.isFinite(item.percent))
+                recordSample(this._history, historyKey(item), item.percent, item.resets_at, now);
+        }
+
         const sessionItem  = limits.find((l) => l.group === 'session');
         const allModels    = limits.find((l) => l.group === 'weekly' && !l.scoped);
 
@@ -462,6 +578,7 @@ export default class AiUsageExtension extends Extension {
 
         // ── Header ────────────────────────────────────────────────────────
         const header = hbox('margin-bottom: 24px; spacing: 10px;');
+        header.add_child(makeClaudeIcon(20));
         header.add_child(label('Your usage limits',
             'font-size: 17px; font-weight: bold; color: #ffffff;'));
         header.add_child(label('Team',
@@ -501,12 +618,34 @@ export default class AiUsageExtension extends Extension {
                 }
 
                 for (const item of items) {
+                    const history = this._history.get(historyKey(item)) ?? [];
                     root.add_child(progressRow(
                         item.label,
-                        resetInfo(item.resets_at),
+                        burnRateMessage(item, history),
                         item.percent,
                     ));
                 }
+            }
+
+            // ── Extra usage spend ────────────────────────────────────────
+            const spentText = spentAmountText(d);
+            if (spentText) {
+                root.add_child(new St.Widget({
+                    style: 'height: 1px; background-color: #2a2a2a; margin-top: 6px; margin-bottom: 18px;',
+                    x_expand: true,
+                }));
+
+                const spendRow = hbox('margin-bottom: 22px; spacing: 16px;');
+                const spendLeft = vbox('');
+                spendLeft.x_expand = true;
+                spendLeft.add_child(label('Extra usage spend',
+                    'font-size: 15px; color: #ffffff;'));
+                spendLeft.add_child(label('Charged beyond your plan limits this cycle',
+                    'font-size: 13px; color: #cccccc; margin-top: 4px;'));
+                spendRow.add_child(spendLeft);
+                spendRow.add_child(label(spentText,
+                    'font-size: 17px; font-weight: bold; color: #ffffff;'));
+                root.add_child(spendRow);
             }
 
             // ── Footer ────────────────────────────────────────────────────
@@ -591,5 +730,6 @@ export default class AiUsageExtension extends Extension {
         this._weeklyTimeLabel = null;
         this._data          = null;
         this._fetchedAt     = null;
+        this._history       = null;
     }
 }
