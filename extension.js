@@ -7,13 +7,34 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+import { TokenCalendar } from './calendar.js';
+import { TokenIndex, GRAN_DAY, dayKey, formatTokens, formatCount, MONTH_NAMES } from './tokens.js';
+
 const HOME        = GLib.get_home_dir();
 const USAGE_PATH  = GLib.build_filenamev([HOME, '.claude', 'usage.json']);
+const BOOSTS_PATH = GLib.build_filenamev([HOME, '.claude', 'usage-boosts.json']);
 const FETCH_SCRIPT = GLib.build_filenamev([HOME, '.claude', 'fetch-usage.sh']);
+const TOKEN_STATS_PATH = GLib.build_filenamev([GLib.get_user_cache_dir(), 'ai-usage', 'token-stats.json']);
+const TOKEN_SCRIPT_NAME = 'token-stats.py';
 
-const POLL_INTERVAL = 30;     // seconds between file re-reads
+const POLL_INTERVAL = 10;     // seconds between file re-reads
+const STALE_AFTER   = 150;    // seconds before the data is flagged as stale
+const TOKEN_SCAN_INTERVAL = 300; // seconds between background transcript scans
+const TOKEN_SCAN_ON_OPEN_AFTER = 60; // opening the tokens tab rescans older stats
 const BAR_WIDTH     = 320;   // px, popup progress bar
+const BAR_SEGMENTS  = 32;
+const PANEL_BAR_SEGMENTS = 8;
 const CLAUDE_COLOR  = '#D4875F';
+const NEON_CYAN     = '#00F0FF';
+const NEON_YELLOW   = '#FCEE0A';
+const NEON_MAGENTA  = '#FF2A6D';
+const BAR_TRACK     = '#151D2B';
+// Green on purpose: severity runs cyan → yellow → magenta, so a boost can
+// never be misread as a warning.
+const BOOST_COLOR   = '#7CFF4F';
+
+const TAB_LIMITS = 'limits';
+const TAB_TOKENS = 'tokens';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -25,10 +46,22 @@ function readJson(path) {
     return null;
 }
 
+// The fetcher writes the file; its mtime is when the data actually came from
+// the API. Wall-clock read time would hide a dead fetcher behind a fresh label.
+function fileMtime(path) {
+    try {
+        const info = Gio.File.new_for_path(path)
+            .query_info('time::modified', Gio.FileQueryInfoFlags.NONE, null);
+        const secs = info.get_attribute_uint64('time::modified');
+        if (secs) return new Date(secs * 1000);
+    } catch (_) {}
+    return null;
+}
+
 function barColor(pct) {
-    if (pct >= 80) return '#ef5350';
-    if (pct >= 50) return '#ffb300';
-    return CLAUDE_COLOR;
+    if (pct >= 80) return NEON_MAGENTA;
+    if (pct >= 50) return NEON_YELLOW;
+    return NEON_CYAN;
 }
 
 function fmt(val) {
@@ -277,6 +310,63 @@ function spentAmountText(d) {
     return null;
 }
 
+// ── promotional boosts ───────────────────────────────────────────────────────
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+// Temporary limit promotions are absent from every usage API — neither the
+// Claude Code OAuth endpoint nor claude.ai's own returns them, so they are
+// declared by hand in usage-boosts.json instead.
+// Accepts a bare array or {"boosts": [...]}; entries whose `ends_at` has
+// passed are dropped, so a finished promotion disappears on its own.
+// An entry with no parsable `ends_at` is treated as open-ended.
+function readBoosts() {
+    const raw  = readJson(BOOSTS_PATH);
+    const list = Array.isArray(raw) ? raw : (Array.isArray(raw?.boosts) ? raw.boosts : []);
+    const now  = Date.now();
+
+    return list
+        .filter((entry) => entry && typeof entry === 'object')
+        .map((entry) => ({
+            label:   String(entry.label ?? 'Usage'),
+            percent: Number.isFinite(entry.boost_percent) ? entry.boost_percent : null,
+            ends_at: entry.ends_at ?? null,
+            note:    entry.note ? String(entry.note) : '',
+        }))
+        .filter((boost) => {
+            const end = boost.ends_at ? new Date(boost.ends_at).getTime() : NaN;
+            return Number.isFinite(end) ? end > now : true;
+        });
+}
+
+function boostPercentText(boost) {
+    return Number.isFinite(boost?.percent) ? `+${Math.round(boost.percent)}%` : '';
+}
+
+// "19 Aug"
+function formatEndDate(iso) {
+    const date = iso ? new Date(iso) : null;
+    if (!date || !Number.isFinite(date.getTime())) return '';
+    return `${date.getDate()} ${MONTHS[date.getMonth()]}`;
+}
+
+// "Ends in 16 d · 19 Aug" (plus the entry's own note, when present)
+function boostSubtitle(boost) {
+    const parts = [];
+    const ms    = boost?.ends_at ? new Date(boost.ends_at) - new Date() : NaN;
+    if (Number.isFinite(ms)) {
+        parts.push(ms <= 0
+            ? 'ending now'
+            : `Ends in ${formatDurationMin(Math.floor(ms / 60_000))}`);
+        const day = formatEndDate(boost.ends_at);
+        if (day) parts.push(day);
+    }
+    if (boost?.note) parts.push(boost.note);
+    return parts.join(' · ');
+}
+
+
 function timeAgo(date) {
     if (!date) return 'never';
     const s = Math.round((new Date() - date) / 1000);
@@ -332,6 +422,38 @@ function makeClaudeIcon(size) {
     return area;
 }
 
+// ── boost bolt icon ───────────────────────────────────────────────────────────
+
+// Bolt outline in a unit square, scaled to the requested size.
+const BOLT_PATH = [
+    [0.60, 0.00], [0.17, 0.57], [0.45, 0.57],
+    [0.37, 1.00], [0.83, 0.41], [0.53, 0.41],
+];
+
+function makeBoltIcon(size, color = BOOST_COLOR) {
+    const area = new St.DrawingArea({
+        width: size,
+        height: size,
+        y_align: Clutter.ActorAlign.CENTER,
+    });
+    area.connect('repaint', (widget) => {
+        const cr = widget.get_context();
+        const [r, g, b] = hexToRgb(color);
+        cr.setSourceRGBA(r, g, b, 1.0);
+
+        cr.newPath();
+        BOLT_PATH.forEach(([x, y], i) => {
+            if (i === 0) cr.moveTo(x * size, y * size);
+            else cr.lineTo(x * size, y * size);
+        });
+        cr.closePath();
+        cr.fill();
+
+        cr.$dispose();
+    });
+    return area;
+}
+
 // ── horizontal progress bar (Cairo) ──────────────────────────────────────────
 
 function hexToRgb(hex) {
@@ -339,31 +461,37 @@ function hexToRgb(hex) {
     return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
 }
 
-function makePanelBar(w, h) {
+// Segmented "power cell" bar: whole segments light up, the partial one is
+// drawn proportionally so small changes stay visible.
+function makePanelBar(w, h, segments) {
     const area = new St.DrawingArea({
         width: w,
         height: h,
         y_align: Clutter.ActorAlign.CENTER,
     });
     area._pct   = 0;
-    area._color = CLAUDE_COLOR;
+    area._color = NEON_CYAN;
 
     area.connect('repaint', (widget) => {
-        const cr  = widget.get_context();
-        const r   = h / 2;   // corner radius = half height → pill shape
+        const cr   = widget.get_context();
+        const gap  = segments >= 16 ? 3 : 1.5;
+        const segW = (w - gap * (segments - 1)) / segments;
+        const lit  = Math.max(0, Math.min(1, widget._pct / 100)) * segments;
+        const [tr, tg, tb] = hexToRgb(BAR_TRACK);
+        const [rr, gg, bb] = hexToRgb(widget._color);
 
-        // Background track
-        cr.setSourceRGBA(0.2, 0.2, 0.2, 1.0);
-        _roundedRect(cr, 0, 0, w, h, r);
-        cr.fill();
-
-        // Filled portion
-        const fill = Math.max(0, Math.min(1, widget._pct / 100)) * w;
-        if (fill > 0) {
-            const [rr, gg, bb] = hexToRgb(widget._color);
-            cr.setSourceRGBA(rr, gg, bb, 1.0);
-            _roundedRect(cr, 0, 0, fill, h, Math.min(r, fill / 2));
+        for (let i = 0; i < segments; i++) {
+            const x = i * (segW + gap);
+            cr.setSourceRGBA(tr, tg, tb, 1.0);
+            cr.rectangle(x, 0, segW, h);
             cr.fill();
+
+            const fraction = Math.max(0, Math.min(1, lit - i));
+            if (fraction > 0) {
+                cr.setSourceRGBA(rr, gg, bb, 1.0);
+                cr.rectangle(x, 0, segW * fraction, h);
+                cr.fill();
+            }
         }
 
         cr.$dispose();
@@ -372,40 +500,30 @@ function makePanelBar(w, h) {
     return area;
 }
 
-function _roundedRect(cr, x, y, w, h, r) {
-    cr.newPath();
-    cr.moveTo(x + r, y);
-    cr.lineTo(x + w - r, y);
-    cr.arc(x + w - r, y + r, r, -Math.PI / 2, 0);
-    cr.lineTo(x + w, y + h - r);
-    cr.arc(x + w - r, y + h - r, r, 0, Math.PI / 2);
-    cr.lineTo(x + r, y + h);
-    cr.arc(x + r, y + h - r, r, Math.PI / 2, Math.PI);
-    cr.lineTo(x, y + r);
-    cr.arc(x + r, y + r, r, Math.PI, 3 * Math.PI / 2);
-    cr.closePath();
-}
-
 // ── popup helpers ─────────────────────────────────────────────────────────────
 
-function label(text, style) {
-    return new St.Label({ text, style });
+function label(text, styleClass, props = {}) {
+    return new St.Label({ text, style_class: styleClass, ...props });
 }
 
-function hbox(style = '') {
-    return new St.BoxLayout({ style });
+function hbox(styleClass = '', props = {}) {
+    return new St.BoxLayout({ style_class: styleClass, ...props });
 }
 
-function vbox(style = '') {
+function vbox(styleClass = '', props = {}) {
     return new St.BoxLayout({
         orientation: Clutter.Orientation.VERTICAL,
-        style,
+        style_class: styleClass,
+        ...props,
     });
 }
 
-// Layout matches the Claude.ai usage page:
-//   [Title            ]  [======-------]  X% used
-//   [Resets in X hr Y ]
+function divider() {
+    return new St.Widget({ style_class: 'aiu-divider', x_expand: true });
+}
+
+//   [Title            ]  [▮▮▮▮▮▮▯▯▯▯▯▯]  X% used
+//   [Subtitle         ]
 function progressRow(title, subtitle, pct, rightText) {
     const hasPct      = Number.isFinite(pct);
     const safe        = hasPct ? Math.min(100, Math.max(0, pct)) : 0;
@@ -414,23 +532,23 @@ function progressRow(title, subtitle, pct, rightText) {
         ? rightText
         : (hasPct ? `${Math.round(pct)}% used` : '—');
 
-    const root = hbox('margin-bottom: 22px; spacing: 16px;');
+    const root = hbox('aiu-row');
 
-    const left = vbox('');
-    left.x_expand = true;
-    left.add_child(label(title, 'font-size: 15px; color: #ffffff;'));
+    const left = vbox('', { x_expand: true });
+    left.add_child(label(title, 'aiu-row-title'));
     if (subtitle)
-        left.add_child(label(subtitle, 'font-size: 13px; color: #cccccc; margin-top: 4px;'));
+        left.add_child(label(subtitle, 'aiu-row-sub'));
     root.add_child(left);
 
-    const barArea = makePanelBar(BAR_WIDTH, 7);
+    const barArea = makePanelBar(BAR_WIDTH, 8, BAR_SEGMENTS);
     barArea._pct   = safe;
     barArea._color = color;
 
-    const right = hbox('spacing: 12px;');
-    right.y_align = Clutter.ActorAlign.CENTER;
+    const right = hbox('', { style: 'spacing: 12px;', y_align: Clutter.ActorAlign.CENTER });
     right.add_child(barArea);
-    right.add_child(label(displayText, 'font-size: 13px; color: #cccccc; min-width: 72px;'));
+    const value = label(displayText, 'aiu-row-value');
+    value.style = `color: ${hasPct ? color : '#5b6b82'};`;
+    right.add_child(value);
     root.add_child(right);
 
     return root;
@@ -438,12 +556,38 @@ function progressRow(title, subtitle, pct, rightText) {
 
 // ── extension ─────────────────────────────────────────────────────────────────
 
+// "8 Jul 2026"
+function formatDay(date) {
+    return `${date.getDate()} ${MONTH_NAMES[date.getMonth()].slice(0, 3)} ${date.getFullYear()}`;
+}
+
+function panelLabel(styleClass, text = '') {
+    return new St.Label({
+        text,
+        style_class: `aiu-panel-mono ${styleClass}`,
+        y_align: Clutter.ActorAlign.CENTER,
+    });
+}
+
 export default class AiUsageExtension extends Extension {
     enable() {
-        this._timer     = null;
-        this._data      = null;
-        this._fetchedAt = null;
-        this._history   = new Map();
+        this._timer        = null;
+        this._tokenTimer   = null;
+        this._monitor      = null;
+        this._monitorId    = null;
+        this._data         = null;
+        this._fetchedAt    = null;
+        this._history      = new Map();
+        this._tab          = TAB_LIMITS;
+        this._tokenIndex   = null;
+        this._tokenScanning = false;
+        this._tokenError   = null;
+        this._cancellable  = new Gio.Cancellable();
+        this._tokenProcs   = new Set();
+        this._calendar     = new TokenCalendar({
+            onExport: (gran) => this._exportTokens(gran),
+            onRescan: () => this._scanTokens(),
+        });
 
         // Panel button — mirrors system-monitor-next pattern:
         // add to panel first, then attach children
@@ -457,48 +601,40 @@ export default class AiUsageExtension extends Extension {
         });
         this._tray.add_child(box);
 
-        // Claude starburst icon (Cairo-drawn, 22 × 22 px)
         box.add_child(makeClaudeIcon(22));
 
-        // Horizontal session progress bar (Cairo-drawn, 48 × 5 px)
-        this._panelBar = makePanelBar(48, 5);
+        this._panelBar = makePanelBar(48, 6, PANEL_BAR_SEGMENTS);
         box.add_child(this._panelBar);
 
-        // Session percentage
-        this._sessionLabel = new St.Label({
-            text: '…',
-            style: 'font-size: 14px; color: #aaaaaa;',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        box.add_child(this._sessionLabel);
+        this._sessionLabel    = panelLabel('', '…');
+        this._timeLabel       = panelLabel('');
+        this._weeklyLabel     = panelLabel('');
+        this._weeklyTimeLabel = panelLabel('');
+        for (const actor of [this._sessionLabel, this._timeLabel, this._weeklyLabel, this._weeklyTimeLabel])
+            box.add_child(actor);
 
-        // Session reset countdown — shown between the two numbers
-        this._timeLabel = new St.Label({
-            text: '',
-            style: 'font-size: 13px; color: #aaaaaa;',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        box.add_child(this._timeLabel);
+        // Promotional boost chip — stays hidden while no boost is active
+        this._boostBox = new St.BoxLayout({ style: 'spacing: 4px; margin-left: 5px;', y_align: Clutter.ActorAlign.CENTER });
+        this._boostBox.add_child(makeBoltIcon(13));
+        // Countdown stays grey like the other two, so only the bolt carries
+        // the accent colour
+        this._boostTimeLabel = panelLabel('');
+        this._boostTimeLabel.style = 'font-size: 13px; color: #aaaaaa;';
+        this._boostBox.add_child(this._boostTimeLabel);
+        this._boostBox.visible = false;
+        box.add_child(this._boostBox);
 
-        // Weekly percentage
-        this._weeklyLabel = new St.Label({
-            text: '',
-            style: 'font-size: 14px; color: #aaaaaa;',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        box.add_child(this._weeklyLabel);
+        // Today's token count — hidden until the first transcript scan lands
+        this._tokenLabel = panelLabel('aiu-panel-tokens');
+        this._tokenLabel.visible = false;
+        box.add_child(this._tokenLabel);
 
-        // Weekly reset countdown
-        this._weeklyTimeLabel = new St.Label({
-            text: '',
-            style: 'font-size: 13px; color: #aaaaaa;',
-            y_align: Clutter.ActorAlign.CENTER,
-        });
-        box.add_child(this._weeklyTimeLabel);
+        this._tray.menu.actor.add_style_class_name('aiu-boxpointer');
+        this._tray.menu.box.add_style_class_name('aiu-menu-box');
 
         // Create the menu item once; rebuild its content on each open
         this._menuItem = new PopupMenu.PopupBaseMenuItem({ reactive: false, can_focus: false });
-        this._menuRoot = vbox('min-width: 600px; padding: 16px 16px 12px 16px;');
+        this._menuRoot = vbox('aiu-root');
         this._menuItem.add_child(this._menuRoot);
         this._tray.menu.addMenuItem(this._menuItem);
 
@@ -512,20 +648,69 @@ export default class AiUsageExtension extends Extension {
             this._refresh();
             return GLib.SOURCE_CONTINUE;
         });
+
+        this._loadTokenStats();
+        this._scanTokens();
+        this._tokenTimer = GLib.timeout_add_seconds(GLib.PRIORITY_LOW, TOKEN_SCAN_INTERVAL, () => {
+            this._scanTokens();
+            return GLib.SOURCE_CONTINUE;
+        });
+
+        // The poll only bounds how stale the display can get; the monitor makes
+        // a new fetch show up at once, which is what matters at a reset.
+        this._monitor = Gio.File.new_for_path(USAGE_PATH)
+            .monitor_file(Gio.FileMonitorFlags.NONE, null);
+        this._monitorId = this._monitor.connect('changed', (_m, _f, _o, event) => {
+            if (event === Gio.FileMonitorEvent.CHANGES_DONE_HINT ||
+                event === Gio.FileMonitorEvent.CREATED ||
+                event === Gio.FileMonitorEvent.RENAMED) {
+                this._refresh();
+                this._rebuildLimitsIfOpen();
+            }
+        });
+    }
+
+    // Rebuilding the tokens tab on every usage.json write would reset the
+    // hovered cell, so only the limits tab follows the fetcher live.
+    _rebuildLimitsIfOpen() {
+        if (this._tray?.menu?.isOpen && this._tab === TAB_LIMITS) this._buildPopup();
     }
 
     // ── data refresh ───────────────────────────────────────────────────────
 
+    // Boosts live in their own file, so the chip updates even when usage data
+    // is missing.
+    _updateBoostChip() {
+        if (!this._boostBox) return;
+
+        const primary = readBoosts()[0] ?? null;
+        this._boostBox.visible = primary !== null;
+
+        const left = primary ? compactUntil(primary.ends_at) : '';
+        this._boostTimeLabel.set_text(left);
+    }
+
+    _updateTokenChip() {
+        if (!this._tokenLabel) return;
+        const index = this._tokenIndex;
+        this._tokenLabel.visible = index !== null;
+        if (index)
+            this._tokenLabel.set_text(`Σ${formatTokens(index.get(GRAN_DAY, dayKey(new Date())).total)}`);
+    }
+
     _refresh() {
+        this._updateBoostChip();
+        this._updateTokenChip();
+
         const d = readJson(USAGE_PATH);
         if (d) {
             this._data      = d;
-            this._fetchedAt = new Date();
+            this._fetchedAt = fileMtime(USAGE_PATH) ?? new Date();
         }
 
         if (!this._data) {
             this._panelBar._pct = 0;
-            this._panelBar._color = '#333333';
+            this._panelBar._color = BAR_TRACK;
             this._panelBar.queue_repaint();
             this._sessionLabel.set_text('—');
             this._sessionLabel.set_style('font-size: 14px; color: #444444;');
@@ -555,159 +740,318 @@ export default class AiUsageExtension extends Extension {
         this._panelBar.queue_repaint();
 
         this._sessionLabel.set_text(fmt(session));
-        this._sessionLabel.set_style(`font-size: 14px; color: ${color};`);
+        this._sessionLabel.set_style(`font-size: 14px; font-weight: bold; color: ${color};`);
 
         const t = compactUntil(sessionItem?.resets_at);
         this._timeLabel.set_text(t ? `· ${t} ·` : '·');
-        this._timeLabel.set_style('font-size: 13px; color: #aaaaaa;');
+        this._timeLabel.set_style('font-size: 13px; color: #8a97ab;');
 
         this._weeklyLabel.set_text(allModels ? fmt(weekly) : '');
-        this._weeklyLabel.set_style(`font-size: 14px; color: ${barColor(weekly ?? 0)};`);
+        this._weeklyLabel.set_style(`font-size: 14px; font-weight: bold; color: ${barColor(weekly ?? 0)};`);
 
         const tw = compactUntil(allModels?.resets_at);
         this._weeklyTimeLabel.set_text(tw ? `· ${tw}` : '');
-        this._weeklyTimeLabel.set_style('font-size: 13px; color: #aaaaaa;');
+        this._weeklyTimeLabel.set_style('font-size: 13px; color: #8a97ab;');
+    }
+
+    // ── token statistics ───────────────────────────────────────────────────
+
+    // Parsing gigabytes of transcripts must never block the compositor, so it
+    // runs in a niced child process that writes a small pre-aggregated JSON.
+    _runTokenScript(args, onDone) {
+        const python = GLib.find_program_in_path('python3');
+        if (!python) {
+            onDone(false, 'python3 not found');
+            return;
+        }
+        const script = GLib.build_filenamev([this.path, TOKEN_SCRIPT_NAME]);
+        // Bound to this enable() cycle: after disable() the callback must not
+        // touch the state of a later enable().
+        const cancellable = this._cancellable;
+        let proc;
+        try {
+            proc = Gio.Subprocess.new(['nice', '-n', '15', python, script, ...args],
+                Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
+        } catch (e) {
+            onDone(false, e.message);
+            return;
+        }
+        this._tokenProcs.add(proc);
+        proc.communicate_utf8_async(null, cancellable, (source, result) => {
+            this._tokenProcs?.delete(source);
+            let ok = false;
+            let output = '';
+            try {
+                const [, stdout, stderr] = source.communicate_utf8_finish(result);
+                ok = source.get_successful();
+                output = ok ? (stdout ?? '') : (stderr ?? '');
+            } catch (e) {
+                output = e.message;
+            }
+            if (cancellable.is_cancelled()) return;
+            onDone(ok, output.trim().split('\n').pop() ?? '');
+        });
+    }
+
+    _loadTokenStats(onLoaded = null) {
+        const cancellable = this._cancellable;
+        Gio.File.new_for_path(TOKEN_STATS_PATH).load_contents_async(cancellable, (file, result) => {
+            if (cancellable.is_cancelled()) return;
+            try {
+                const [, bytes] = file.load_contents_finish(result);
+                const raw = JSON.parse(new TextDecoder().decode(bytes));
+                if (raw?.hours) this._tokenIndex = new TokenIndex(raw);
+            } catch (e) {
+                if (!e.matches?.(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND))
+                    this._tokenError = `bad stats file: ${e.message}`;
+            }
+            this._applyTokenStats();
+            onLoaded?.();
+        });
+    }
+
+    _applyTokenStats() {
+        this._updateTokenChip();
+        this._updateTokenStatus();
+        if (this._tray?.menu?.isOpen && this._tab === TAB_TOKENS)
+            this._calendar.setIndex(this._tokenIndex);
+    }
+
+    _updateTokenStatus() {
+        const index = this._tokenIndex;
+        if (this._tokenScanning) {
+            this._calendar.setStatus('SCANNING TRANSCRIPTS…');
+        } else if (this._tokenError) {
+            this._calendar.setStatus(`SCAN FAILED · ${this._tokenError}`, true);
+        } else if (index) {
+            const since = index.firstDate ? ` since ${formatDay(index.firstDate)}` : '';
+            this._calendar.setStatus(
+                `${formatCount(index.messageCount)} responses${since} · synced ${timeAgo(index.generatedAt)}`);
+        }
+    }
+
+    _scanTokens() {
+        if (this._tokenScanning) return;
+        this._tokenScanning = true;
+        this._updateTokenStatus();
+        this._runTokenScript([], (ok, message) => {
+            this._tokenScanning = false;
+            this._tokenError = ok ? null : (message || 'unknown error');
+            this._loadTokenStats();
+        });
+    }
+
+    _exportTokens(granularity) {
+        const dir = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD) ?? HOME;
+        const stamp = GLib.DateTime.new_now_local().format('%Y%m%d-%H%M%S');
+        const path = GLib.build_filenamev([dir, `ai-tokens-${granularity}-${stamp}.csv`]);
+        const shown = path.startsWith(HOME) ? `~${path.slice(HOME.length)}` : path;
+
+        this._calendar.setStatus(`EXPORTING ${granularity.toUpperCase()}…`);
+        this._runTokenScript(['--csv', path, '--granularity', granularity], (ok, message) => {
+            if (ok) {
+                this._calendar.setStatus(`SAVED → ${shown}`);
+                Main.notify('AI Usage Limits', `Token usage (${granularity}) exported to ${shown}`);
+                this._loadTokenStats(() => this._calendar.setStatus(`SAVED → ${shown}`));
+            } else {
+                this._calendar.setStatus(`EXPORT FAILED · ${message}`, true);
+            }
+        });
     }
 
     // ── popup ──────────────────────────────────────────────────────────────
 
+    _buildHeader() {
+        const header = hbox('aiu-header');
+        const icon = makeClaudeIcon(20);
+        header.add_child(icon);
+
+        const title = hbox('', { style: 'spacing: 0;', y_align: Clutter.ActorAlign.CENTER });
+        title.add_child(label('AI', 'aiu-title'));
+        title.add_child(label('//', 'aiu-title-slash'));
+        title.add_child(label('USAGE', 'aiu-title'));
+        header.add_child(title);
+        header.add_child(label('TEAM', 'aiu-tag', { y_align: Clutter.ActorAlign.CENTER }));
+
+        header.add_child(new St.Widget({ x_expand: true }));
+
+        const tabs = hbox('aiu-tabs', { y_align: Clutter.ActorAlign.CENTER });
+        for (const [key, text] of [[TAB_LIMITS, 'LIMITS'], [TAB_TOKENS, 'TOKENS']]) {
+            const tab = new St.Button({
+                label: text,
+                style_class: `aiu-tab${this._tab === key ? ' aiu-tab-active' : ''}`,
+                can_focus: true,
+                track_hover: true,
+            });
+            tab.connect('clicked', () => {
+                if (this._tab === key) return;
+                this._tab = key;
+                this._buildPopup();
+            });
+            tabs.add_child(tab);
+        }
+        header.add_child(tabs);
+        return header;
+    }
+
     _buildPopup() {
+        const calendarActor = this._calendar?.actor;
+        calendarActor?.get_parent()?.remove_child(calendarActor);
         // Reuse the permanent menu item — only clear and refill its inner container
         this._menuRoot.destroy_all_children();
         const root = this._menuRoot;
 
-        // ── Header ────────────────────────────────────────────────────────
-        const header = hbox('margin-bottom: 24px; spacing: 10px;');
-        header.add_child(makeClaudeIcon(20));
-        header.add_child(label('Your usage limits',
-            'font-size: 17px; font-weight: bold; color: #ffffff;'));
-        header.add_child(label('Team',
-            'font-size: 15px; color: #cccccc;'));
-        root.add_child(header);
+        root.add_child(this._buildHeader());
+        root.add_child(new St.Widget({ style_class: 'aiu-scanline', x_expand: true }));
+
+        if (this._tab === TAB_TOKENS) {
+            root.add_child(calendarActor);
+            this._calendar.setIndex(this._tokenIndex);
+            this._updateTokenStatus();
+            const ageSec = this._tokenIndex?.generatedAt
+                ? (Date.now() - this._tokenIndex.generatedAt.getTime()) / 1000 : Infinity;
+            if (ageSec > TOKEN_SCAN_ON_OPEN_AFTER) this._scanTokens();
+            return;
+        }
+
+        this._buildLimits(root);
+    }
+
+    _buildLimits(root) {
+        // ── Temporary boosts ──────────────────────────────────────────────
+        const boosts = readBoosts();
+        if (boosts.length > 0) {
+            const boostHeading = hbox('', { style: 'spacing: 8px;' });
+            boostHeading.add_child(makeBoltIcon(14));
+            boostHeading.add_child(label('TEMPORARY BOOSTS', 'aiu-section',
+                { style: `color: ${BOOST_COLOR};`, x_expand: true }));
+            root.add_child(boostHeading);
+
+            for (const boost of boosts) {
+                const row = hbox('aiu-row');
+
+                const left = vbox('', { x_expand: true });
+                left.add_child(label(boost.label, 'aiu-row-title'));
+                const subtitle = boostSubtitle(boost);
+                if (subtitle)
+                    left.add_child(label(subtitle, 'aiu-row-sub'));
+                row.add_child(left);
+
+                const pct = boostPercentText(boost);
+                if (pct)
+                    row.add_child(label(pct, 'aiu-boost-value', { y_align: Clutter.ActorAlign.CENTER }));
+
+                root.add_child(row);
+            }
+
+            root.add_child(label(
+                "When each promotion ends, limits return to your plan's standard amounts.",
+                'aiu-muted', { style: 'margin-bottom: 14px;' }));
+            root.add_child(divider());
+        }
 
         const d = this._data;
         if (!d) {
-            root.add_child(label('No data yet — waiting for fetch-usage.sh',
-                'font-size: 13px; color: #aaaaaa;'));
-        } else {
-            const limits = normalizeLimits(d);
+            root.add_child(label('NO SIGNAL — waiting for fetch-usage.sh', 'aiu-muted'));
+            return;
+        }
 
-            // Group descriptors by `group`, preserving first-seen order,
-            // then float the session group to the top.
-            const byGroup = new Map();
-            for (const item of limits) {
-                const g = item.group ?? 'other';
-                if (!byGroup.has(g)) byGroup.set(g, []);
-                byGroup.get(g).push(item);
-            }
-            const seen = [...byGroup.keys()];
-            const orderedGroups = [
-                ...seen.filter((g) => g === 'session'),
-                ...seen.filter((g) => g !== 'session'),
-            ];
+        const limits = normalizeLimits(d);
 
-            // The session group keeps its headingless style (its row is already
-            // titled "Current session"); every other group gets a section heading.
-            for (const g of orderedGroups) {
-                const items = byGroup.get(g);
-                if (!items || items.length === 0) continue;
+        // ── Extra usage spend ────────────────────────────────────────────
+        const spentText = spentAmountText(d);
+        if (spentText) {
+            const spendRow = hbox('aiu-row');
+            const spendLeft = vbox('', { x_expand: true });
+            spendLeft.add_child(label('Extra usage spend', 'aiu-row-title'));
+            spendLeft.add_child(label('Charged beyond your plan limits this cycle', 'aiu-row-sub'));
+            spendRow.add_child(spendLeft);
+            spendRow.add_child(label(spentText, 'aiu-money', { y_align: Clutter.ActorAlign.CENTER }));
+            root.add_child(spendRow);
+            root.add_child(divider());
+        }
 
-                if (g !== 'session') {
-                    root.add_child(label(sectionHeading(g),
-                        'font-size: 16px; font-weight: bold; color: #ffffff; margin-bottom: 18px; margin-top: 6px;'));
-                }
+        // Group descriptors by `group`, preserving first-seen order,
+        // then float the session group to the top.
+        const byGroup = new Map();
+        for (const item of limits) {
+            const g = item.group ?? 'other';
+            if (!byGroup.has(g)) byGroup.set(g, []);
+            byGroup.get(g).push(item);
+        }
+        const seen = [...byGroup.keys()];
+        const orderedGroups = [
+            ...seen.filter((g) => g === 'session'),
+            ...seen.filter((g) => g !== 'session'),
+        ];
 
-                for (const item of items) {
-                    const history = this._history.get(historyKey(item)) ?? [];
-                    root.add_child(progressRow(
-                        item.label,
-                        burnRateMessage(item, history),
-                        item.percent,
-                    ));
-                }
-            }
+        for (const g of orderedGroups) {
+            const items = byGroup.get(g);
+            if (!items || items.length === 0) continue;
 
-            // ── Extra usage spend ────────────────────────────────────────
-            const spentText = spentAmountText(d);
-            if (spentText) {
-                root.add_child(new St.Widget({
-                    style: 'height: 1px; background-color: #2a2a2a; margin-top: 6px; margin-bottom: 18px;',
-                    x_expand: true,
-                }));
+            root.add_child(label(sectionHeading(g).toUpperCase(), 'aiu-section'));
 
-                const spendRow = hbox('margin-bottom: 22px; spacing: 16px;');
-                const spendLeft = vbox('');
-                spendLeft.x_expand = true;
-                spendLeft.add_child(label('Extra usage spend',
-                    'font-size: 15px; color: #ffffff;'));
-                spendLeft.add_child(label('Charged beyond your plan limits this cycle',
-                    'font-size: 13px; color: #cccccc; margin-top: 4px;'));
-                spendRow.add_child(spendLeft);
-                spendRow.add_child(label(spentText,
-                    'font-size: 17px; font-weight: bold; color: #ffffff;'));
-                root.add_child(spendRow);
-            }
-
-            // ── Footer ────────────────────────────────────────────────────
-            root.add_child(new St.Widget({
-                style: 'height: 1px; background-color: #2a2a2a; margin-top: 4px; margin-bottom: 12px;',
-                x_expand: true,
-            }));
-
-            const footer = hbox('spacing: 8px;');
-            footer.add_child(label(
-                `Last updated: ${timeAgo(this._fetchedAt)}`,
-                'font-size: 13px; color: #bbbbbb;',
-            ));
-            const refreshBtn = label('↺', 'font-size: 16px; color: #aaaaaa;');
-            refreshBtn.reactive    = true;
-            refreshBtn.track_hover = true;
-            refreshBtn.connect('notify::hover', () => {
-                refreshBtn.set_style(
-                    `font-size: 16px; color: ${refreshBtn.hover ? '#cccccc' : '#666666'};`
-                );
-            });
-            refreshBtn.connect('button-press-event', () => {
-                this._fetchNow();
-                // Rebuild immediately so "Last updated" timestamp refreshes at once
-                this._refresh();
-                this._buildPopup();
-                return Clutter.EVENT_STOP;
-            });
-            footer.add_child(refreshBtn);
-            root.add_child(footer);
-
-            // ── Additional features ───────────────────────────────────────
-            if (d.daily_routines) {
-                root.add_child(new St.Widget({
-                    style: 'height: 1px; background-color: #2a2a2a; margin-top: 12px; margin-bottom: 16px;',
-                    x_expand: true,
-                }));
-                root.add_child(label('Additional features',
-                    'font-size: 15px; font-weight: bold; color: #eeeeee; margin-bottom: 18px;'));
-
-                const used  = d.daily_routines.used  ?? 0;
-                const limit = d.daily_routines.limit ?? 25;
-                const pct   = limit > 0 ? (used / limit) * 100 : 0;
+            for (const item of items) {
+                const history = this._history.get(historyKey(item)) ?? [];
                 root.add_child(progressRow(
-                    'Daily included routine runs',
-                    d.daily_routines.subtitle ?? '',
-                    pct,
-                    `${used} / ${limit}`,
+                    item.label,
+                    burnRateMessage(item, history),
+                    item.percent,
                 ));
             }
         }
 
+        // ── Additional features ───────────────────────────────────────────
+        if (d.daily_routines) {
+            root.add_child(label('ADDITIONAL FEATURES', 'aiu-section aiu-section-magenta'));
+
+            const used  = d.daily_routines.used  ?? 0;
+            const limit = d.daily_routines.limit ?? 25;
+            const pct   = limit > 0 ? (used / limit) * 100 : 0;
+            root.add_child(progressRow(
+                'Daily included routine runs',
+                d.daily_routines.subtitle ?? '',
+                pct,
+                `${used} / ${limit}`,
+            ));
+        }
+
+        // ── Footer ────────────────────────────────────────────────────────
+        root.add_child(divider());
+
+        const footer = hbox('aiu-footer');
+        const ageSec = this._fetchedAt
+            ? (Date.now() - this._fetchedAt.getTime()) / 1000 : Infinity;
+        const stale  = ageSec > STALE_AFTER;
+        footer.add_child(label(
+            `LAST SYNC ${timeAgo(this._fetchedAt).toUpperCase()}${stale ? ' · FETCHER STALLED' : ''}`,
+            stale ? 'aiu-alert' : 'aiu-muted', { y_align: Clutter.ActorAlign.CENTER }));
+        footer.add_child(new St.Widget({ x_expand: true }));
+        const refreshBtn = new St.Button({
+            label: '↻',
+            style_class: 'aiu-icon-button',
+            can_focus: true,
+            track_hover: true,
+        });
+        refreshBtn.connect('clicked', () => {
+            this._fetchNow();
+            // Rebuild immediately so "Last updated" timestamp refreshes at once
+            this._refresh();
+            this._buildPopup();
+        });
+        footer.add_child(refreshBtn);
+        root.add_child(footer);
     }
 
     _fetchNow() {
         try {
+            const cancellable = this._cancellable;
             const proc = Gio.Subprocess.new(['/bin/bash', FETCH_SCRIPT], Gio.SubprocessFlags.NONE);
-            proc.wait_async(null, (source, result) => {
+            proc.wait_async(cancellable, (source, result) => {
                 try { source.wait_finish(result); } catch (_) {}
-                if (!this._panelBar) return;
+                if (cancellable.is_cancelled()) return;
                 this._refresh();
-                if (this._tray?.menu?.isOpen) this._buildPopup();
+                this._rebuildLimitsIfOpen();
             });
         } catch (_) {}
     }
@@ -715,10 +1059,24 @@ export default class AiUsageExtension extends Extension {
     // ── cleanup ────────────────────────────────────────────────────────────
 
     disable() {
-        if (this._timer !== null) {
-            GLib.source_remove(this._timer);
-            this._timer = null;
+        for (const id of [this._timer, this._tokenTimer]) {
+            if (id !== null) GLib.source_remove(id);
         }
+        this._timer      = null;
+        this._tokenTimer = null;
+        this._cancellable?.cancel();
+        this._cancellable = null;
+        // A scan left running would keep writing the shared index after disable().
+        for (const proc of this._tokenProcs ?? []) proc.force_exit();
+        this._tokenProcs = null;
+        if (this._monitor) {
+            if (this._monitorId) this._monitor.disconnect(this._monitorId);
+            this._monitor.cancel();
+            this._monitor   = null;
+            this._monitorId = null;
+        }
+        this._calendar?.destroy();
+        this._calendar      = null;
         this._tray?.destroy();
         this._tray          = null;
         this._menuItem      = null;
@@ -728,6 +1086,10 @@ export default class AiUsageExtension extends Extension {
         this._timeLabel       = null;
         this._weeklyLabel     = null;
         this._weeklyTimeLabel = null;
+        this._boostBox        = null;
+        this._boostTimeLabel  = null;
+        this._tokenLabel      = null;
+        this._tokenIndex      = null;
         this._data          = null;
         this._fetchedAt     = null;
         this._history       = null;
