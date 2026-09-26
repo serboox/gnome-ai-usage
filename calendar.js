@@ -25,7 +25,7 @@ const PARENT_VIEW = {
     [VIEW_YEAR]: VIEW_ALL,
 };
 
-export const EXPORT_GRANULARITIES = ['hour', 'day', 'week', 'month', 'year'];
+export const EXPORT_GRANULARITIES = ['hour', 'day', 'week', 'month', 'year', 'cycle'];
 
 const SHORT_MONTHS = T.MONTH_NAMES.map((m) => m.slice(0, 3).toUpperCase());
 const SHORT_DAYS = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
@@ -771,7 +771,7 @@ export class TokenCalendar {
         exportLabel.y_align = Clutter.ActorAlign.CENTER;
         row.add_child(exportLabel);
         for (const gran of EXPORT_GRANULARITIES)
-            row.add_child(button(gran.toUpperCase(), 'aiu-chip', () => this._onExport(gran)));
+            row.add_child(button(gran === 'cycle' ? 'CYCLES' : gran.toUpperCase(), 'aiu-chip', () => this._onExport(gran)));
 
         row.add_child(spacer());
         this._statusLabel = label(this._status, this._statusAlert ? 'aiu-alert' : 'aiu-muted');

@@ -115,14 +115,23 @@ transcripts Claude Code and Codex already keep:
 The first scan reaches back as far as those transcripts do (Claude Code prunes old sessions
 according to its `cleanupPeriodDays` setting). After that the index keeps every response it has
 seen, even once its transcript is pruned, so the history keeps growing past the cleanup window.
+A schema upgrade only forces a full rescan; it never drops stored rows.
 Periods before the oldest indexed response are shown as empty "no signal" tiles rather than
-zeros. Delete `~/.cache/ai-usage/tokens.sqlite` to rebuild from the transcripts that exist now.
+zeros.
+
+The index is long-lived user data, so it lives in `~/.local/share/ai-usage/tokens.sqlite`
+(`$XDG_DATA_HOME`), not in the cache; an index left in `~/.cache/ai-usage/` by older versions
+is copied there on the next scan (verified, then the old file is renamed to
+`tokens.sqlite.migrated` and can be deleted). Once a day a consistent snapshot is written with
+`VACUUM INTO` to `~/.local/share/ai-usage/backups/tokens-YYYYMMDD.sqlite`; the last 7 are kept.
+Deleting the index rebuilds it only from the transcripts that still exist, so older history
+would be lost — restore a snapshot instead.
 
 Hours are local wall-clock hours: on a DST fall-back day the repeated hour is counted in one
 tile, and the hour skipped in spring is shown as an empty tile.
 
 `token-stats.py` does the parsing in a niced child process, never inside GNOME Shell. It is
-incremental: a SQLite index in `~/.cache/ai-usage/tokens.sqlite` remembers how far each file
+incremental: the SQLite index remembers how far each file
 was read, so a rescan only reads new lines (about half a second; the first full scan of a few
 gigabytes takes several seconds). It writes hourly aggregates to
 `~/.cache/ai-usage/token-stats.json`, which the extension reads. The scan runs on enable, every
@@ -154,6 +163,28 @@ Views:
   ```bash
   python3 token-stats.py --csv tokens.csv --granularity day   # hour|day|week|month|year
   ```
+
+## Tokens per 1% of a limit and weekly cycles
+
+Each limit row on the **LIMITS** tab shows how many tokens one percent of that limit cost in the
+current window, e.g. `≈ 47.9M tokens per 1% · 4.41B this cycle`. The window is the 5 hours
+(session) or 7 days (weekly) before `resets_at`; a model-scoped limit ("Fable only") counts only
+that model family. Below 1% the integer utilization is too coarse, so nothing is shown.
+
+**WEEKLY CYCLES** lists the last 8 weekly cycles: tokens spent, the share of the weekly limit
+used, and tokens per 1%. Utilization history comes from two places, because no usage API keeps
+one:
+
+- the usage line the SessionStart hook writes into every transcript
+  (`limit=seven_day, utilization=42%, resets in 7484 min (…)`), which reaches back as far as the
+  transcripts do;
+- `~/.claude/usage.json`, sampled on every scan from now on.
+
+The percent is the highest value seen in the cycle. A finished cycle whose last sample landed more
+than a day before its reset is shown as a lower bound (`≥91%`); a cycle with no sample at all has
+its bounds inferred by stepping back 7 days from a known reset and shows tokens only. Tokens come
+from this machine only, so usage on other devices or on claude.ai makes the real cost per percent
+higher than shown. **EXPORT CSV › CYCLES** writes the same table with every token column.
 
 Tests: `gjs -m tests/tokens.test.js` and `python3 -m unittest discover -s tests`.
 

@@ -62,5 +62,15 @@ eq(index.range(new Date(2026, 8, 21), 7).total, 125, 'range');
 eq(index.get(T.GRAN_DAY, '1999-01-01').total, 0, 'missing key');
 eq(index.years(), [2026], 'years');
 
+eq([T.limitId('session'), T.limitId('weekly'), T.limitId('weekly', 'Fable'), T.limitId('other')],
+    ['session', 'weekly_all', 'weekly:fable', null], 'limit ids match token-stats.py');
+eq([T.limitId('weekly', 'Sonnet 5'), T.modelFamily('claude-opus-5-5'), T.modelFamily('')], ['weekly:sonnet', 'opus', null], 'model family');
+eq([T.tokensPerPercent(900, 90), T.tokensPerPercent(900, 0.4), T.tokensPerPercent(900, null)], [10, null, null], 'tokens per percent');
+eq(T.sumTokens([1, 2, 3, 4, 99]), 10, 'sum ignores message count');
+const cyc = new T.TokenIndex({ hours: {}, cycles: { weekly_all: [{ start: 100, end: 200, tokens: [1, 1, 1, 1, 1] }, { start: 200, end: 300 }] } });
+eq([cyc.currentCycle('weekly_all', 150_000)?.end, cyc.currentCycle('weekly_all', 200_000)?.end, cyc.currentCycle('weekly_all', 400_000)],
+    [200, 300, null], 'current cycle is half-open');
+eq(cyc.cycles('missing'), [], 'missing limit has no cycles');
+
 print(failures ? `${failures} failure(s)` : 'all tests passed');
 if (failures) System.exit(1);

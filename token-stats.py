@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
 import csv
 import fcntl
+import itertools
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -12,12 +15,19 @@ from pathlib import Path
 
 HOME = Path.home()
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "ai-usage"
-DB_PATH = CACHE_DIR / "tokens.sqlite"
+# The index outlives the transcripts it was built from, so it is user data
+# (XDG_DATA_HOME), not a disposable cache.
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local" / "share")) / "ai-usage"
+DB_PATH = DATA_DIR / "tokens.sqlite"
+LEGACY_DB_PATH = CACHE_DIR / "tokens.sqlite"
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_KEEP = 7
 STATS_PATH = CACHE_DIR / "token-stats.json"
 LOCK_PATH = CACHE_DIR / "token-stats.lock"
 
 CLAUDE_ROOTS = [HOME / ".claude" / "projects"]
 CODEX_ROOTS = [HOME / ".codex" / "sessions", HOME / ".codex" / "archived_sessions"]
+USAGE_PATH = HOME / ".claude" / "usage.json"
 
 SOURCE_CLAUDE = "claude"
 SOURCE_CODEX = "codex"
@@ -33,8 +43,8 @@ GRANULARITY_FORMATS = {
     "year": "%Y",
 }
 
-# Bump when stored rows must be rebuilt from scratch.
-SCHEMA_VERSION = 2
+# Bump to force a full rescan of every transcript; stored rows are kept.
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -53,7 +63,43 @@ CREATE TABLE IF NOT EXISTS messages (
     output      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_ts ON messages (ts);
+CREATE TABLE IF NOT EXISTS limit_samples (
+    limit_id    TEXT NOT NULL,
+    resets_at   INTEGER NOT NULL,
+    ts          INTEGER NOT NULL,
+    utilization REAL NOT NULL,
+    PRIMARY KEY (limit_id, resets_at, ts)
+);
 """
+
+
+HOUR = 3600
+DAY = 24 * HOUR
+WEEK = 7 * DAY
+SESSION_PERIOD = 5 * HOUR
+WEEKLY_ALL = "weekly_all"
+SESSION = "session"
+# resets_at drifts by a fraction of a second between fetches ("16:59:59.58" vs
+# "17:00:00"); rounding folds those into one cycle.
+RESET_ROUNDING = 600
+# A finished cycle counts as fully observed when a sample landed this close to its reset.
+FINAL_SAMPLE_WINDOW = DAY
+
+# The SessionStart usage hook writes this line into every transcript, which
+# leaves a history of limit utilization that no API keeps.
+HOOK_SAMPLE_RE = re.compile(
+    r"limit=([a-z_]+), utilization=([0-9.]+)%, resets in ([0-9]+) min \(([0-9T:.+Z-]+)\)")
+HOOK_EVENT = "SessionStart"
+# Two readings of one reset can drift across a rounding boundary; ends closer
+# than this are the same reset.
+RESET_MERGE_WINDOW = 30 * 60
+# Pre-limits[] usage.json keys, with the utilization field they carry.
+LEGACY_USAGE_KEYS = {
+    "five_hour": SESSION,
+    "seven_day": WEEKLY_ALL,
+    "seven_day_sonnet": "weekly:sonnet",
+    "seven_day_opus": "weekly:opus",
+}
 
 
 def parse_ts(value):
@@ -67,6 +113,89 @@ def parse_ts(value):
 
 def as_int(value):
     return value if isinstance(value, int) and value > 0 else 0
+
+
+def round_reset(ts):
+    return int(round(ts / RESET_ROUNDING) * RESET_ROUNDING)
+
+
+def model_family(name):
+    """"Sonnet 5" / "claude-sonnet-5" -> "sonnet"."""
+    words = re.findall(r"[a-z]+", str(name or "").lower())
+    words = [word for word in words if word != "claude"]
+    return words[0] if words else None
+
+
+def hook_limit_id(name):
+    if name == "five_hour":
+        return SESSION
+    if name == "seven_day":
+        return WEEKLY_ALL
+    if name.startswith("seven_day_"):
+        family = model_family(name.removeprefix("seven_day_"))
+        return f"weekly:{family}" if family else None
+    return None
+
+
+def hook_samples(raw):
+    # The same text also turns up in prompts, tool output and replies that quote
+    # it, so only the SessionStart hook attachment itself is trusted.
+    if b"utilization=" not in raw or b'"attachment"' not in raw:
+        return []
+    try:
+        entry = json.loads(raw)
+    except ValueError:
+        return []
+    attachment = entry.get("attachment") if entry.get("type") == "attachment" else None
+    if not isinstance(attachment, dict) or attachment.get("hookEvent") != HOOK_EVENT:
+        return []
+    content = attachment.get("content")
+    texts = [attachment.get("stdout"), *(content if isinstance(content, list) else [content])]
+    samples = set()
+    for text in texts:
+        if not isinstance(text, str):
+            continue
+        for name, utilization, minutes, resets in HOOK_SAMPLE_RE.findall(text):
+            limit_id = hook_limit_id(name)
+            resets_at = parse_ts(resets)
+            if limit_id and resets_at is not None:
+                taken = resets_at - int(minutes) * 60
+                samples.add((limit_id, round_reset(resets_at), taken, float(utilization)))
+    return list(samples)
+
+
+def usage_limit_id(item):
+    family = model_family(((item.get("scope") or {}).get("model") or {}).get("display_name"))
+    if item.get("group") == "session":
+        return SESSION
+    if item.get("group") == "weekly":
+        return f"weekly:{family}" if family else WEEKLY_ALL
+    return None
+
+
+def live_samples():
+    """Current utilization from the fetcher's usage.json, stamped with its mtime."""
+    try:
+        data = json.loads(USAGE_PATH.read_text())
+        taken = int(USAGE_PATH.stat().st_mtime)
+    except (OSError, ValueError):
+        return []
+    readings = []
+    if isinstance(data.get("limits"), list) and data["limits"]:
+        for item in data["limits"]:
+            if isinstance(item, dict):
+                readings.append((usage_limit_id(item), item.get("resets_at"), item.get("percent")))
+    else:
+        for key, limit_id in LEGACY_USAGE_KEYS.items():
+            block = data.get(key)
+            if isinstance(block, dict):
+                readings.append((limit_id, block.get("resets_at"), block.get("utilization")))
+    samples = []
+    for limit_id, resets, percent in readings:
+        resets_at = parse_ts(resets)
+        if limit_id and resets_at is not None and isinstance(percent, (int, float)):
+            samples.append((limit_id, round_reset(resets_at), taken, float(percent)))
+    return samples
 
 
 def iter_new_lines(path, offset):
@@ -155,6 +284,14 @@ def codex_records(raw, state):
     )]
 
 
+def save_samples(db, samples):
+    db.executemany(
+        "INSERT INTO limit_samples VALUES (?, ?, ?, ?) ON CONFLICT(limit_id, resets_at, ts) "
+        "DO UPDATE SET utilization = max(utilization, excluded.utilization)",
+        samples,
+    )
+
+
 def scan_file(db, path, source):
     row = db.execute("SELECT offset, state FROM files WHERE path = ?", (str(path),)).fetchone()
     offset, state = (row[0], json.loads(row[1] or "{}")) if row else (0, {})
@@ -168,12 +305,14 @@ def scan_file(db, path, source):
         return 0
 
     records = []
+    samples = []
     end = offset
     for raw, end in iter_new_lines(path, offset):
         if source == SOURCE_CLAUDE:
             record = claude_record(raw)
             if record:
                 records.append(record)
+            samples.extend(hook_samples(raw))
         else:
             records.extend(codex_records(raw, state))
 
@@ -186,6 +325,7 @@ def scan_file(db, path, source):
         "cache_read = max(cache_read, excluded.cache_read), output = max(output, excluded.output)",
         records,
     )
+    save_samples(db, samples)
     db.execute(
         "INSERT INTO files (path, offset, state) VALUES (?, ?, ?) "
         "ON CONFLICT(path) DO UPDATE SET offset = excluded.offset, state = excluded.state",
@@ -201,6 +341,7 @@ def scan(db):
             if root.is_dir():
                 for path in sorted(root.rglob("*.jsonl")):
                     scanned += scan_file(db, path, source)
+    save_samples(db, live_samples())
     db.commit()
     return scanned
 
@@ -218,6 +359,105 @@ def aggregate(db, granularity):
             bucket[index] += value
         bucket[4] += 1
     return buckets
+
+
+def limit_period(limit_id):
+    return SESSION_PERIOD if limit_id == SESSION else WEEK
+
+
+def cycle_tokens(db, limit_id, start, end):
+    query = ("SELECT SUM(input), SUM(cache_write), SUM(cache_read), SUM(output), COUNT(*) "
+             "FROM messages WHERE source = ? AND ts >= ? AND ts < ?")
+    params = [SOURCE_CLAUDE, start, end]
+    # A model-scoped limit ("weekly:sonnet") only counts that model family.
+    if limit_id.startswith("weekly:"):
+        family = limit_id.split(":", 1)[1]
+        query += " AND (model LIKE ? OR model LIKE ? OR model = ?)"
+        params += [f"%-{family}-%", f"%-{family}", family]
+    return [value or 0 for value in db.execute(query, params).fetchone()]
+
+
+def inferred_weekly_ends(sampled_ends, first_ts):
+    """Weekly resets repeat every 7 days, so gaps without samples are filled by stepping back."""
+    if not sampled_ends or first_ts is None:
+        return []
+    ends = sorted(sampled_ends)
+    inferred = []
+    end = ends[0] - WEEK
+    while end > first_ts:
+        inferred.append(end)
+        end -= WEEK
+    for earlier, later in itertools.pairwise(ends):
+        end = later - WEEK
+        while end > earlier + DAY:
+            inferred.append(end)
+            end -= WEEK
+    return inferred
+
+
+def merge_close_ends(by_end):
+    """Fold resets closer than RESET_MERGE_WINDOW into the most sampled one."""
+    merged = {}
+    group = []
+
+    def flush():
+        if not group:
+            return
+        end = max(group, key=lambda e: (by_end[e][2], e))
+        merged[end] = (
+            max(by_end[e][0] for e in group),
+            max(by_end[e][1] for e in group),
+            sum(by_end[e][2] for e in group),
+        )
+
+    for end in sorted(by_end):
+        if group and end - group[-1] > RESET_MERGE_WINDOW:
+            flush()
+            group = []
+        group.append(end)
+    flush()
+    return merged
+
+
+def build_cycles(db, now):
+    first_ts = db.execute("SELECT MIN(ts) FROM messages WHERE source = ?", (SOURCE_CLAUDE,)).fetchone()[0]
+    sampled = {}
+    for limit_id, resets_at, percent, last_ts, count in db.execute(
+        "SELECT limit_id, resets_at, MAX(utilization), MAX(ts), COUNT(*) "
+        "FROM limit_samples GROUP BY limit_id, resets_at"
+    ):
+        sampled.setdefault(limit_id, {})[resets_at] = (percent, last_ts, count)
+    sampled = {limit_id: merge_close_ends(by_end) for limit_id, by_end in sampled.items()}
+
+    cycles = {}
+    for limit_id, by_end in sampled.items():
+        ends = dict(by_end)
+        if limit_id == WEEKLY_ALL:
+            for end in inferred_weekly_ends(ends.keys(), first_ts):
+                ends.setdefault(end, None)
+        ordered = sorted(ends)
+        if limit_id == SESSION:
+            ordered = ordered[-1:]
+        period = limit_period(limit_id)
+        records = []
+        previous_end = None
+        for end in ordered:
+            # A moved reset time would otherwise make two cycles overlap.
+            start = max(end - period, previous_end or 0)
+            previous_end = end
+            sample = ends[end]
+            percent, last_ts, count = sample if sample else (None, None, 0)
+            records.append({
+                "start": start,
+                "end": end,
+                "percent": percent,
+                "samples": count,
+                "last_sample": last_ts,
+                "final": bool(last_ts and end <= now and last_ts >= end - FINAL_SAMPLE_WINDOW),
+                "tokens": cycle_tokens(db, limit_id, start, min(end, now)),
+            })
+        cycles[limit_id] = records
+    return cycles
 
 
 def write_stats(db):
@@ -238,13 +478,38 @@ def write_stats(db):
         "fields": ["input", "cache_write", "cache_read", "output", "messages"],
         "models": models,
         "hours": hours,
+        "cycles": build_cycles(db, int(time.time())),
     }
     temporary = STATS_PATH.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, separators=(",", ":")))
     temporary.replace(STATS_PATH)
 
 
+def write_cycles_csv(db, out_path):
+    records = build_cycles(db, int(time.time())).get(WEEKLY_ALL, [])
+    with open(out_path, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["cycle_start", "cycle_end", "percent_used", "percent_final", "input",
+                         "cache_write", "cache_read", "output", "total", "messages",
+                         "tokens_per_percent"])
+        for cycle in records:
+            inp, cw, cr, out, messages = cycle["tokens"]
+            total = inp + cw + cr + out
+            percent = cycle["percent"]
+            writer.writerow([
+                time.strftime("%Y-%m-%dT%H:%M", time.localtime(cycle["start"])),
+                time.strftime("%Y-%m-%dT%H:%M", time.localtime(cycle["end"])),
+                "" if percent is None else percent,
+                cycle["final"],
+                inp, cw, cr, out, total, messages,
+                round(total / percent) if percent else "",
+            ])
+    return len(records)
+
+
 def write_csv(db, out_path, granularity):
+    if granularity == "cycle":
+        return write_cycles_csv(db, out_path)
     rows = sorted(aggregate(db, granularity).items())
     with open(out_path, "w", newline="") as handle:
         writer = csv.writer(handle)
@@ -256,21 +521,77 @@ def write_csv(db, out_path, granularity):
     return len(rows)
 
 
+def migrate_legacy_db():
+    """Copy an index left in the cache by older versions into DATA_DIR.
+
+    The SQLite backup API carries any WAL content with it and the result is
+    verified before it is published by an atomic rename. The legacy file is
+    renamed, not deleted, so nothing is lost if an older process still has it.
+    """
+    if not LEGACY_DB_PATH.exists() or DB_PATH.exists():
+        return
+    temporary = DB_PATH.with_suffix(".migrating")
+    temporary.unlink(missing_ok=True)
+    source = sqlite3.connect(LEGACY_DB_PATH)
+    target = sqlite3.connect(temporary)
+    try:
+        source.backup(target)
+        if target.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise sqlite3.DatabaseError("migrated index failed quick_check")
+    except sqlite3.Error:
+        target.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close()
+    target.close()
+    temporary.replace(DB_PATH)
+    LEGACY_DB_PATH.replace(LEGACY_DB_PATH.with_suffix(".sqlite.migrated"))
+
+
+def daily_backup(db):
+    """One consistent snapshot per day, so a bad release can never erase the history.
+
+    Best effort: a failed snapshot (a full disk, say) must not stop the stats
+    and export that follow it.
+    """
+    target = BACKUP_DIR / f"tokens-{time.strftime('%Y%m%d')}.sqlite"
+    temporary = target.with_suffix(".tmp")
+    try:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        if not target.exists():
+            temporary.unlink(missing_ok=True)
+            db.execute("VACUUM INTO ?", (str(temporary),))
+            temporary.replace(target)
+        for old in sorted(BACKUP_DIR.glob("tokens-*.sqlite"))[:-BACKUP_KEEP]:
+            old.unlink()
+    except (OSError, sqlite3.Error) as error:
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        print(f"warning: daily backup failed: {error}", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Aggregate AI token usage from local transcripts.")
     parser.add_argument("--csv", metavar="PATH", help="export aggregated usage to a CSV file")
-    parser.add_argument("--granularity", choices=GRANULARITY_FORMATS, default="day")
+    parser.add_argument("--granularity", choices=[*GRANULARITY_FORMATS, "cycle"], default="day")
     args = parser.parse_args()
 
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(LOCK_PATH, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        migrate_legacy_db()
         db = sqlite3.connect(DB_PATH)
         if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
-            db.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS messages;")
+            # Only the read offsets are reset. Stored messages and samples must
+            # survive: their transcripts may already be pruned, and a full rescan
+            # can only raise the kept values (see the upsert in scan_file).
+            db.execute("DROP TABLE IF EXISTS files")
             db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         db.executescript(SCHEMA)
         scan(db)
+        daily_backup(db)
         write_stats(db)
         if args.csv:
             count = write_csv(db, args.csv, args.granularity)

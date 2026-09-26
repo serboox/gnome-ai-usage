@@ -26,6 +26,11 @@ export const GRAN_WEEK  = 'week';
 export const GRAN_MONTH = 'month';
 export const GRAN_YEAR  = 'year';
 
+export const LIMIT_SESSION    = 'session';
+export const LIMIT_WEEKLY_ALL = 'weekly_all';
+// Below this the integer utilization is too coarse for a per-percent figure.
+export const MIN_PERCENT_FOR_RATE = 1;
+
 export const BLOCK_HOURS = 4;
 export const HEAT_LEVELS = 8;
 
@@ -94,6 +99,29 @@ export function formatTokens(value) {
 
 export function formatCount(value) {
     return Math.round(value ?? 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// "Sonnet 5" / "claude-sonnet-5" → "sonnet"; mirrors model_family() in token-stats.py.
+export function modelFamily(name) {
+    const words = String(name ?? '').toLowerCase().match(/[a-z]+/g) ?? [];
+    return words.find((word) => word !== 'claude') ?? null;
+}
+
+// Same ids as token-stats.py: "session", "weekly_all", "weekly:<model family>".
+export function limitId(group, modelName = null) {
+    if (group === 'session') return LIMIT_SESSION;
+    if (group !== 'weekly') return null;
+    const family = modelFamily(modelName);
+    return family ? `weekly:${family}` : LIMIT_WEEKLY_ALL;
+}
+
+export function sumTokens(tokens) {
+    return (tokens ?? []).slice(0, KIND_COUNT).reduce((sum, value) => sum + (value ?? 0), 0);
+}
+
+export function tokensPerPercent(tokens, percent) {
+    if (!Number.isFinite(percent) || percent < MIN_PERCENT_FOR_RATE) return null;
+    return tokens / percent;
 }
 
 export class Aggregate {
@@ -214,6 +242,7 @@ export class TokenIndex {
         ]);
         this._scales = new Map();
         this.all = new Aggregate();
+        this._cycles = payload?.cycles ?? {};
 
         for (const [key, models] of Object.entries(payload?.hours ?? {})) {
             const day = key.slice(0, 10);
@@ -269,6 +298,16 @@ export class TokenIndex {
         const agg = new Aggregate();
         for (let i = 0; i < days; i++) agg.merge(this.get(GRAN_DAY, dayKey(addDays(start, i))));
         return agg;
+    }
+
+    // Oldest first; each is {start, end, percent, final, tokens, ...} with epoch seconds.
+    cycles(id) {
+        return Array.isArray(this._cycles[id]) ? this._cycles[id] : [];
+    }
+
+    currentCycle(id, now = Date.now()) {
+        const seconds = now / 1000;
+        return this.cycles(id).find((c) => c.start <= seconds && seconds < c.end) ?? null;
     }
 
     sourceOf(key) {
