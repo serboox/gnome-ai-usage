@@ -199,6 +199,56 @@ class TokenStatsTest(unittest.TestCase):
         backups.write_text("a file where the backup directory should be")
         self.assertEqual(self.run_script()["messages"], 1)
 
+    def test_cycles_are_stored_and_never_shrink(self):
+        (self.projects / "a.jsonl").write_text(
+            self.hook_line(80, 600, "2026-09-28T17:00:00Z") +
+            claude_line("msg_1", "req_1", "2026-09-26T10:00:00Z", USAGE))
+        self.run_script()
+        db = sqlite3.connect(self.home / ".local" / "share" / "ai-usage" / "tokens.sqlite")
+        db.execute("DELETE FROM limit_samples")
+        db.execute("DELETE FROM messages")
+        db.commit()
+        db.close()
+        cycle = self.run_script()["cycles"]["weekly_all"][-1]
+        self.assertEqual(cycle["percent"], 80.0)
+        self.assertEqual(sum(cycle["tokens"][:4]), 1111)
+
+    def stored_cycles(self, since):
+        db = sqlite3.connect(self.home / ".local" / "share" / "ai-usage" / "tokens.sqlite")
+        rows = db.execute(
+            'SELECT start, "end", input, percent FROM cycles WHERE limit_id = ? AND "end" >= ?',
+            ("weekly_all", since)).fetchall()
+        db.close()
+        return rows
+
+    def test_reset_drifting_across_an_hour_keeps_one_stored_cycle(self):
+        path = self.projects / "a.jsonl"
+        path.write_text(self.hook_line(40, 900, "2026-09-28T17:20:00Z"))
+        self.run_script()
+        with path.open("a") as handle:
+            handle.write(self.hook_line(50, 600, "2026-09-28T17:40:00Z"))
+            handle.write(self.hook_line(55, 300, "2026-09-28T17:40:00Z"))
+        self.run_script()
+        rows = self.stored_cycles(1790614800 - 3600)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3], 55.0)
+
+    def test_moved_window_replaces_tokens_instead_of_keeping_the_max(self):
+        path = self.projects / "a.jsonl"
+        path.write_text(
+            self.hook_line(40, 900, "2026-09-28T17:00:00Z") +
+            claude_line("msg_1", "req_1", "2026-09-21T17:10:00Z", USAGE))
+        self.run_script()
+        self.assertEqual(self.stored_cycles(1790614800 - 3600)[0][2], 10)
+        # later samples move the reset 20 minutes on; the first message falls out of the window
+        with path.open("a") as handle:
+            for minutes in (600, 500, 400):
+                handle.write(self.hook_line(50, minutes, "2026-09-28T17:20:00Z"))
+        self.run_script()
+        rows = self.stored_cycles(1790614800 - 3600)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][2], 0)
+
     def test_csv_export_matches_totals(self):
         (self.projects / "a.jsonl").write_text(
             claude_line("msg_1", "req_1", "2026-09-24T10:00:00Z", USAGE) +

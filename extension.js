@@ -8,8 +8,10 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
 import { TokenCalendar } from './calendar.js';
+import { CycleCalendar } from './cycles.js';
+import { hexToRgb, severityColor } from './colors.js';
 import {
-    TokenIndex, GRAN_DAY, LIMIT_WEEKLY_ALL, dayKey, formatTokens, formatCount, limitId,
+    TokenIndex, formatTokens, formatCount, limitId,
     sumTokens, tokensPerPercent, MONTH_NAMES,
 } from './tokens.js';
 
@@ -28,26 +30,9 @@ const BAR_WIDTH     = 320;   // px, popup progress bar
 const BAR_SEGMENTS  = 32;
 const PANEL_BAR_SEGMENTS = 8;
 const CLAUDE_COLOR  = '#D4875F';
-const NEON_CYAN     = '#00F0FF';
-const NEON_YELLOW   = '#FCEE0A';
-const NEON_MAGENTA  = '#FF2A6D';
-const BAR_TRACK     = '#151D2B';
-// The top bar is always in view, so its calm state is a muted teal rather
-// than the popup's full neon cyan.
-const PANEL_CALM    = '#6FAFBB';
-// Green on purpose: severity runs cyan → yellow → magenta, so a boost can
-// never be misread as a warning.
-const BOOST_COLOR   = '#7CFF4F';
-
-const CYCLE_ROWS = 8;
-const CYCLE_BAR_WIDTH = 120;
-const CYCLE_BAR_SEGMENTS = 12;
-const CYCLE_COLUMNS = [
-    ['CYCLE', 'aiu-cycle-dates'],
-    ['TOKENS', 'aiu-cycle-num'],
-    ['LIMIT USED', 'aiu-cycle-used'],
-    ['PER 1%', 'aiu-cycle-num'],
-];
+const BAR_TRACK     = '#111A24';
+// The same mint as the low-usage severity green; the bolt icon tells them apart.
+const BOOST_COLOR   = '#7ED99F';
 
 const HEADER_SIDE_WIDTH = 240;
 
@@ -74,16 +59,6 @@ function fileMtime(path) {
         if (secs) return new Date(secs * 1000);
     } catch (_) {}
     return null;
-}
-
-function barColor(pct) {
-    if (pct >= 80) return NEON_MAGENTA;
-    if (pct >= 50) return NEON_YELLOW;
-    return NEON_CYAN;
-}
-
-function panelColor(pct) {
-    return pct >= 50 ? barColor(pct) : PANEL_CALM;
 }
 
 function fmt(val) {
@@ -480,21 +455,18 @@ function makeBoltIcon(size, color = BOOST_COLOR) {
 
 // ── horizontal progress bar (Cairo) ──────────────────────────────────────────
 
-function hexToRgb(hex) {
-    const n = parseInt(hex.slice(1), 16);
-    return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255];
-}
-
 // Segmented "power cell" bar: whole segments light up, the partial one is
-// drawn proportionally so small changes stay visible.
+// drawn proportionally so small changes stay visible. Each segment keeps the
+// severity colour of its own position, so the lit edge matches the number.
 function makePanelBar(w, h, segments) {
     const area = new St.DrawingArea({
         width: w,
         height: h,
         y_align: Clutter.ActorAlign.CENTER,
     });
-    area._pct   = 0;
-    area._color = NEON_CYAN;
+    area._pct = 0;
+    const segmentColors = Array.from({ length: segments },
+        (_, i) => hexToRgb(severityColor((i + 0.5) / segments * 100)));
 
     area.connect('repaint', (widget) => {
         const cr   = widget.get_context();
@@ -502,7 +474,6 @@ function makePanelBar(w, h, segments) {
         const segW = (w - gap * (segments - 1)) / segments;
         const lit  = Math.max(0, Math.min(1, widget._pct / 100)) * segments;
         const [tr, tg, tb] = hexToRgb(BAR_TRACK);
-        const [rr, gg, bb] = hexToRgb(widget._color);
 
         for (let i = 0; i < segments; i++) {
             const x = i * (segW + gap);
@@ -512,6 +483,7 @@ function makePanelBar(w, h, segments) {
 
             const fraction = Math.max(0, Math.min(1, lit - i));
             if (fraction > 0) {
+                const [rr, gg, bb] = segmentColors[i];
                 cr.setSourceRGBA(rr, gg, bb, 1.0);
                 cr.rectangle(x, 0, segW * fraction, h);
                 cr.fill();
@@ -551,7 +523,7 @@ function divider() {
 function progressRow(title, subtitle, pct, rightText) {
     const hasPct      = Number.isFinite(pct);
     const safe        = hasPct ? Math.min(100, Math.max(0, pct)) : 0;
-    const color       = barColor(safe);
+    const color       = severityColor(safe);
     const displayText = rightText !== undefined
         ? rightText
         : (hasPct ? `${Math.round(pct)}% used` : '—');
@@ -565,13 +537,12 @@ function progressRow(title, subtitle, pct, rightText) {
     root.add_child(left);
 
     const barArea = makePanelBar(BAR_WIDTH, 8, BAR_SEGMENTS);
-    barArea._pct   = safe;
-    barArea._color = color;
+    barArea._pct = safe;
 
     const right = hbox('', { style: 'spacing: 12px;', y_align: Clutter.ActorAlign.CENTER });
     right.add_child(barArea);
     const value = label(displayText, 'aiu-row-value');
-    value.style = `color: ${hasPct ? color : '#5b6b82'};`;
+    value.style = `color: ${hasPct ? color : '#55697e'};`;
     right.add_child(value);
     root.add_child(right);
 
@@ -583,11 +554,6 @@ function progressRow(title, subtitle, pct, rightText) {
 // "8 Jul 2026"
 function formatDay(date) {
     return `${date.getDate()} ${MONTH_NAMES[date.getMonth()].slice(0, 3)} ${date.getFullYear()}`;
-}
-
-// "21 Sep"
-function formatShortDay(date) {
-    return `${date.getDate()} ${MONTH_NAMES[date.getMonth()].slice(0, 3)}`;
 }
 
 function panelLabel(styleClass, text = '') {
@@ -613,6 +579,7 @@ export default class AiUsageExtension extends Extension {
         this._tokenError   = null;
         this._cancellable  = new Gio.Cancellable();
         this._tokenProcs   = new Set();
+        this._cycleCalendar = new CycleCalendar();
         this._calendar     = new TokenCalendar({
             onExport: (gran) => this._exportTokens(gran),
             onRescan: () => this._scanTokens(),
@@ -620,7 +587,10 @@ export default class AiUsageExtension extends Extension {
 
         // Panel button — mirrors system-monitor-next pattern:
         // add to panel first, then attach children
-        this._tray = new PanelMenu.Button(0.5);
+        this._tray = new PanelMenu.Button(0.0);
+        // The popup's left edge sits on the button's left edge; centring a wide
+        // popup on the button clamps it against the screen edge instead.
+        this._tray.menu.actor.setSourceAlignment(0.0);
         // Add to the right end of the left box so the clock stays centered
         Main.panel._addToPanelBox('claude-usage', this._tray, -1, Main.panel._leftBox);
 
@@ -635,11 +605,14 @@ export default class AiUsageExtension extends Extension {
         this._panelBar = makePanelBar(48, 6, PANEL_BAR_SEGMENTS);
         box.add_child(this._panelBar);
 
-        this._sessionLabel    = panelLabel('', '…');
-        this._timeLabel       = panelLabel('');
-        this._weeklyLabel     = panelLabel('');
-        this._weeklyTimeLabel = panelLabel('');
-        for (const actor of [this._sessionLabel, this._timeLabel, this._weeklyLabel, this._weeklyTimeLabel])
+        this._sessionLabel        = panelLabel('', '…');
+        this._timeLabel           = panelLabel('');
+        this._sessionTokensLabel  = panelLabel('aiu-panel-tokens');
+        this._groupSeparator      = panelLabel('', '·');
+        this._weeklyLabel         = panelLabel('');
+        this._weeklyTimeLabel     = panelLabel('');
+        for (const actor of [this._sessionLabel, this._timeLabel, this._sessionTokensLabel,
+            this._groupSeparator, this._weeklyLabel, this._weeklyTimeLabel])
             box.add_child(actor);
 
         // Promotional boost chip — stays hidden while no boost is active
@@ -652,11 +625,6 @@ export default class AiUsageExtension extends Extension {
         this._boostBox.add_child(this._boostTimeLabel);
         this._boostBox.visible = false;
         box.add_child(this._boostBox);
-
-        // Today's token count — hidden until the first transcript scan lands
-        this._tokenLabel = panelLabel('aiu-panel-tokens');
-        this._tokenLabel.visible = false;
-        box.add_child(this._tokenLabel);
 
         this._tray.menu.actor.add_style_class_name('aiu-boxpointer');
         this._tray.menu.box.add_style_class_name('aiu-menu-box');
@@ -719,17 +687,21 @@ export default class AiUsageExtension extends Extension {
         this._boostTimeLabel.set_text(left);
     }
 
-    _updateTokenChip() {
-        if (!this._tokenLabel) return;
-        const index = this._tokenIndex;
-        this._tokenLabel.visible = index !== null;
-        if (index)
-            this._tokenLabel.set_text(`Σ${formatTokens(index.get(GRAN_DAY, dayKey(new Date())).total)}`);
+    // Tokens spent in the current session window, from local transcripts
+    // only; hidden until the first scan lands.
+    _updateTokenLabels() {
+        if (!this._sessionTokensLabel) return;
+        const limits = this._data ? normalizeLimits(this._data) : [];
+        const show = (actor, item) => {
+            const cycle = item ? this._tokenIndex?.currentCycle(item.limitId) : null;
+            actor.set_text(cycle ? `· Σ${formatTokens(sumTokens(cycle.tokens))}` : '');
+            actor.visible = cycle !== null;
+        };
+        show(this._sessionTokensLabel, limits.find((l) => l.group === 'session'));
     }
 
     _refresh() {
         this._updateBoostChip();
-        this._updateTokenChip();
 
         const d = readJson(USAGE_PATH);
         if (d) {
@@ -739,13 +711,14 @@ export default class AiUsageExtension extends Extension {
 
         if (!this._data) {
             this._panelBar._pct = 0;
-            this._panelBar._color = BAR_TRACK;
             this._panelBar.queue_repaint();
             this._sessionLabel.set_text('—');
             this._sessionLabel.set_style('font-size: 14px; color: #444444;');
             this._timeLabel.set_text('');
+            this._groupSeparator.visible = false;
             this._weeklyLabel.set_text('');
             this._weeklyTimeLabel.set_text('');
+            this._updateTokenLabels();
             return;
         }
 
@@ -762,25 +735,29 @@ export default class AiUsageExtension extends Extension {
         const session = sessionItem?.percent ?? null;
         const weekly  = allModels?.percent ?? null;
         const safe    = Math.min(100, Math.max(0, session ?? 0));
-        const color   = panelColor(session ?? 0);
+        const color   = severityColor(session ?? 0);
 
-        this._panelBar._pct   = safe;
-        this._panelBar._color = color;
+        this._panelBar._pct = safe;
         this._panelBar.queue_repaint();
 
         this._sessionLabel.set_text(fmt(session));
         this._sessionLabel.set_style(`font-size: 14px; font-weight: bold; color: ${color};`);
 
         const t = compactUntil(sessionItem?.resets_at);
-        this._timeLabel.set_text(t ? `· ${t} ·` : '·');
+        this._timeLabel.set_text(t ? `· ${t}` : '');
         this._timeLabel.set_style('font-size: 13px; color: #8a97ab;');
 
+        this._groupSeparator.visible = Boolean(allModels);
+        this._groupSeparator.set_style('font-size: 13px; color: #8a97ab;');
+
         this._weeklyLabel.set_text(allModels ? fmt(weekly) : '');
-        this._weeklyLabel.set_style(`font-size: 14px; font-weight: bold; color: ${panelColor(weekly ?? 0)};`);
+        this._weeklyLabel.set_style(`font-size: 14px; font-weight: bold; color: ${severityColor(weekly ?? 0)};`);
 
         const tw = compactUntil(allModels?.resets_at);
         this._weeklyTimeLabel.set_text(tw ? `· ${tw}` : '');
         this._weeklyTimeLabel.set_style('font-size: 13px; color: #8a97ab;');
+
+        this._updateTokenLabels();
     }
 
     // ── token statistics ───────────────────────────────────────────────────
@@ -840,7 +817,7 @@ export default class AiUsageExtension extends Extension {
     }
 
     _applyTokenStats() {
-        this._updateTokenChip();
+        this._updateTokenLabels();
         this._updateTokenStatus();
         if (this._tray?.menu?.isOpen && this._tab === TAB_TOKENS)
             this._calendar.setIndex(this._tokenIndex);
@@ -1098,48 +1075,12 @@ export default class AiUsageExtension extends Extension {
     }
 
     _buildCycles(root) {
-        const cycles = this._tokenIndex?.cycles(LIMIT_WEEKLY_ALL) ?? [];
-        if (cycles.length === 0) return;
-
-        root.add_child(label('WEEKLY CYCLES', 'aiu-section aiu-section-magenta'));
-        const header = hbox('aiu-cycle-row');
-        for (const [text, cls] of CYCLE_COLUMNS)
-            header.add_child(label(text, `aiu-cycle-head ${cls}`));
-        root.add_child(header);
-
-        const nowSec = Date.now() / 1000;
-        for (const cycle of [...cycles].reverse().slice(0, CYCLE_ROWS)) {
-            const current = cycle.start <= nowSec && nowSec < cycle.end;
-            const total = sumTokens(cycle.tokens);
-            const percent = Number.isFinite(cycle.percent) ? cycle.percent : null;
-            // A finished cycle whose last sample came well before the reset may
-            // have ended higher than we saw.
-            const lowerBound = !current && !cycle.final && percent !== null;
-            const rate = tokensPerPercent(total, percent);
-
-            const row = hbox(`aiu-cycle-row${current ? ' aiu-cycle-current' : ''}`);
-            const end = new Date(cycle.end * 1000);
-            const start = new Date(cycle.start * 1000);
-            row.add_child(label(`${formatShortDay(start)} – ${formatShortDay(end)}${current ? '  NOW' : ''}`,
-                'aiu-cycle-cell aiu-cycle-dates'));
-            row.add_child(label(total > 0 ? formatTokens(total) : '—', 'aiu-cycle-cell aiu-cycle-num'));
-
-            const used = hbox('aiu-cycle-cell aiu-cycle-used');
-            const bar = makePanelBar(CYCLE_BAR_WIDTH, 6, CYCLE_BAR_SEGMENTS);
-            bar._pct = percent ?? 0;
-            bar._color = percent === null ? BAR_TRACK : barColor(percent);
-            used.add_child(bar);
-            const pctText = percent === null ? '—' : `${lowerBound ? '≥' : ''}${Math.round(percent)}%`;
-            used.add_child(label(pctText, 'aiu-cycle-pct',
-                { style: `color: ${percent === null ? '#5b6b82' : barColor(percent)};` }));
-            row.add_child(used);
-
-            row.add_child(label(rate === null ? '—' : formatTokens(rate), 'aiu-cycle-cell aiu-cycle-num'));
-            root.add_child(row);
-        }
+        const calendar = this._cycleCalendar.build(this._tokenIndex);
+        if (calendar.get_n_children() === 0) return;
+        root.add_child(calendar);
         root.add_child(label(
             'Tokens come from this machine only; percent is the highest value seen in the cycle.',
-            'aiu-muted', { style: 'margin: 4px 0 14px 0;' }));
+            'aiu-muted', { style: 'margin: 6px 0 14px 0;' }));
     }
 
     _fetchNow() {
@@ -1176,6 +1117,7 @@ export default class AiUsageExtension extends Extension {
         }
         this._calendar?.destroy();
         this._calendar      = null;
+        this._cycleCalendar = null;
         this._tray?.destroy();
         this._tray          = null;
         this._menuItem      = null;
@@ -1183,11 +1125,12 @@ export default class AiUsageExtension extends Extension {
         this._panelBar        = null;
         this._sessionLabel    = null;
         this._timeLabel       = null;
+        this._groupSeparator  = null;
         this._weeklyLabel     = null;
         this._weeklyTimeLabel = null;
         this._boostBox        = null;
         this._boostTimeLabel  = null;
-        this._tokenLabel      = null;
+        this._sessionTokensLabel = null;
         this._tokenIndex      = null;
         this._data          = null;
         this._fetchedAt     = null;

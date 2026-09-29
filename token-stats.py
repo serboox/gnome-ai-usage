@@ -63,6 +63,22 @@ CREATE TABLE IF NOT EXISTS messages (
     output      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_ts ON messages (ts);
+CREATE TABLE IF NOT EXISTS cycles (
+    limit_id    TEXT NOT NULL,
+    cycle_key   INTEGER NOT NULL,
+    start       INTEGER NOT NULL,
+    "end"       INTEGER NOT NULL,
+    percent     REAL,
+    final       INTEGER NOT NULL,
+    samples     INTEGER NOT NULL,
+    last_sample INTEGER,
+    input       INTEGER NOT NULL,
+    cache_write INTEGER NOT NULL,
+    cache_read  INTEGER NOT NULL,
+    output      INTEGER NOT NULL,
+    messages    INTEGER NOT NULL,
+    PRIMARY KEY (limit_id, cycle_key)
+);
 CREATE TABLE IF NOT EXISTS limit_samples (
     limit_id    TEXT NOT NULL,
     resets_at   INTEGER NOT NULL,
@@ -286,6 +302,7 @@ def codex_records(raw, state):
 
 def save_samples(db, samples):
     db.executemany(
+        "-- name: SaveLimitSample :exec\n"
         "INSERT INTO limit_samples VALUES (?, ?, ?, ?) ON CONFLICT(limit_id, resets_at, ts) "
         "DO UPDATE SET utilization = max(utilization, excluded.utilization)",
         samples,
@@ -293,7 +310,7 @@ def save_samples(db, samples):
 
 
 def scan_file(db, path, source):
-    row = db.execute("SELECT offset, state FROM files WHERE path = ?", (str(path),)).fetchone()
+    row = db.execute("-- name: FileOffset :one\nSELECT offset, state FROM files WHERE path = ?", (str(path),)).fetchone()
     offset, state = (row[0], json.loads(row[1] or "{}")) if row else (0, {})
     try:
         size = path.stat().st_size
@@ -319,6 +336,7 @@ def scan_file(db, path, source):
     # Claude Code rewrites a streaming response several times with growing
     # output counts, so every field keeps the largest value seen for its key.
     db.executemany(
+        "-- name: SaveMessage :exec\n"
         "INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET "
         "ts = min(ts, excluded.ts), input = max(input, excluded.input), "
         "cache_write = max(cache_write, excluded.cache_write), "
@@ -327,6 +345,7 @@ def scan_file(db, path, source):
     )
     save_samples(db, samples)
     db.execute(
+        "-- name: SaveFileOffset :exec\n"
         "INSERT INTO files (path, offset, state) VALUES (?, ?, ?) "
         "ON CONFLICT(path) DO UPDATE SET offset = excluded.offset, state = excluded.state",
         (str(path), end, json.dumps(state) if state else None),
@@ -350,6 +369,7 @@ def aggregate(db, granularity):
     buckets = {}
     fmt = GRANULARITY_FORMATS[granularity]
     rows = db.execute(
+        "-- name: AllMessages :many\n"
         "SELECT ts, source, model, input, cache_write, cache_read, output FROM messages ORDER BY ts"
     )
     for ts, source, model, *tokens in rows:
@@ -366,7 +386,8 @@ def limit_period(limit_id):
 
 
 def cycle_tokens(db, limit_id, start, end):
-    query = ("SELECT SUM(input), SUM(cache_write), SUM(cache_read), SUM(output), COUNT(*) "
+    query = ("-- name: CycleTokens :one\n"
+             "SELECT SUM(input), SUM(cache_write), SUM(cache_read), SUM(output), COUNT(*) "
              "FROM messages WHERE source = ? AND ts >= ? AND ts < ?")
     params = [SOURCE_CLAUDE, start, end]
     # A model-scoped limit ("weekly:sonnet") only counts that model family.
@@ -420,9 +441,11 @@ def merge_close_ends(by_end):
 
 
 def build_cycles(db, now):
-    first_ts = db.execute("SELECT MIN(ts) FROM messages WHERE source = ?", (SOURCE_CLAUDE,)).fetchone()[0]
+    first_ts = db.execute(
+        "-- name: FirstClaudeMessage :one\nSELECT MIN(ts) FROM messages WHERE source = ?", (SOURCE_CLAUDE,)).fetchone()[0]
     sampled = {}
     for limit_id, resets_at, percent, last_ts, count in db.execute(
+        "-- name: SampledResets :many\n"
         "SELECT limit_id, resets_at, MAX(utilization), MAX(ts), COUNT(*) "
         "FROM limit_samples GROUP BY limit_id, resets_at"
     ):
@@ -436,8 +459,6 @@ def build_cycles(db, now):
             for end in inferred_weekly_ends(ends.keys(), first_ts):
                 ends.setdefault(end, None)
         ordered = sorted(ends)
-        if limit_id == SESSION:
-            ordered = ordered[-1:]
         period = limit_period(limit_id)
         records = []
         previous_end = None
@@ -460,6 +481,88 @@ def build_cycles(db, now):
     return cycles
 
 
+# Resets drift by up to RESET_MERGE_WINDOW, so a cycle is keyed by its end
+# rounded to the hour, which stays stable while more samples arrive.
+def cycle_key(end):
+    return int(round(end / HOUR) * HOUR)
+
+
+TOKEN_COLUMNS = ("input", "cache_write", "cache_read", "output", "messages")
+SAME_WINDOW = 'start = excluded.start AND "end" = excluded."end"'
+SAVE_CYCLE_SQL = (
+    "-- name: SaveCycle :exec\n"
+    "INSERT INTO cycles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT(limit_id, cycle_key) DO UPDATE SET "
+    "percent = CASE WHEN excluded.percent IS NULL THEN percent "
+    "WHEN percent IS NULL THEN excluded.percent ELSE max(percent, excluded.percent) END, "
+    "final = max(final, excluded.final), "
+    "samples = max(samples, excluded.samples), "
+    "last_sample = CASE WHEN excluded.last_sample IS NULL THEN last_sample "
+    "WHEN last_sample IS NULL THEN excluded.last_sample "
+    "ELSE max(last_sample, excluded.last_sample) END, "
+    + ", ".join(
+        f"{column} = CASE WHEN {SAME_WINDOW} THEN max({column}, excluded.{column}) "
+        f"ELSE excluded.{column} END"
+        for column in TOKEN_COLUMNS
+    )
+    + ', start = excluded.start, "end" = excluded."end"'
+)
+
+
+def stored_key(stored, end):
+    """Key of an already stored cycle whose reset is within RESET_MERGE_WINDOW of `end`."""
+    for key, stored_end in stored:
+        if abs(stored_end - end) <= RESET_MERGE_WINDOW:
+            return key
+    return cycle_key(end)
+
+
+def save_cycles(db, cycles):
+    """Keep every cycle ever computed.
+
+    A reset that drifts across an hour boundary updates its stored row instead
+    of adding a second one. Within an unchanged window a recomputation can only
+    raise stored values; when the window itself moved, the new computation is
+    the only consistent one and replaces the token counts (messages are never
+    dropped, so nothing is lost by that).
+    """
+    stored = {}
+    for limit_id, key, end in db.execute(
+        "-- name: StoredCycleEnds :many\n"
+        "SELECT limit_id, cycle_key, \"end\" FROM cycles"
+    ):
+        stored.setdefault(limit_id, []).append((key, end))
+    rows = []
+    for limit_id, records in cycles.items():
+        for cycle in records:
+            key = stored_key(stored.get(limit_id, []), cycle["end"])
+            rows.append((limit_id, key, cycle["start"], cycle["end"],
+                         cycle["percent"], int(cycle["final"]), cycle["samples"],
+                         cycle["last_sample"], *cycle["tokens"]))
+    db.executemany(SAVE_CYCLE_SQL, rows)
+    db.commit()
+
+
+def load_cycles(db):
+    cycles = {}
+    for (limit_id, start, end, percent, final, samples, last_sample,
+         *tokens) in db.execute(
+        "-- name: LoadCycles :many\n"
+        "SELECT limit_id, start, \"end\", percent, final, samples, last_sample, "
+        "input, cache_write, cache_read, output, messages FROM cycles ORDER BY limit_id, \"end\""
+    ):
+        cycles.setdefault(limit_id, []).append({
+            "start": start, "end": end, "percent": percent, "final": bool(final),
+            "samples": samples, "last_sample": last_sample, "tokens": tokens,
+        })
+    return cycles
+
+
+def refresh_cycles(db):
+    save_cycles(db, build_cycles(db, int(time.time())))
+    return load_cycles(db)
+
+
 def write_stats(db):
     hours = {}
     models = {}
@@ -468,7 +571,8 @@ def write_stats(db):
         key = f"{source}/{model}"
         hours.setdefault(period[:13], {})[key] = values
         models[key] = {"source": source, "model": model}
-    first, last, count = db.execute("SELECT MIN(ts), MAX(ts), COUNT(*) FROM messages").fetchone()
+    first, last, count = db.execute(
+        "-- name: MessageSpan :one\nSELECT MIN(ts), MAX(ts), COUNT(*) FROM messages").fetchone()
     payload = {
         "version": 2,
         "generated_at": int(time.time()),
@@ -478,7 +582,9 @@ def write_stats(db):
         "fields": ["input", "cache_write", "cache_read", "output", "messages"],
         "models": models,
         "hours": hours,
-        "cycles": build_cycles(db, int(time.time())),
+        # Sessions are stored in full but only the latest is needed on screen.
+        "cycles": {limit_id: records[-1:] if limit_id == SESSION else records
+                   for limit_id, records in refresh_cycles(db).items()},
     }
     temporary = STATS_PATH.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, separators=(",", ":")))
@@ -486,7 +592,7 @@ def write_stats(db):
 
 
 def write_cycles_csv(db, out_path):
-    records = build_cycles(db, int(time.time())).get(WEEKLY_ALL, [])
+    records = refresh_cycles(db).get(WEEKLY_ALL, [])
     with open(out_path, "w", newline="") as handle:
         writer = csv.writer(handle)
         writer.writerow(["cycle_start", "cycle_end", "percent_used", "percent_final", "input",

@@ -72,5 +72,12 @@ eq([cyc.currentCycle('weekly_all', 150_000)?.end, cyc.currentCycle('weekly_all',
     [200, 300, null], 'current cycle is half-open');
 eq(cyc.cycles('missing'), [], 'missing limit has no cycles');
 
+eq([T.yearSlots(2026).count, T.yearSlots(2012).count], [53, 54], 'week slots per year');
+const slots = T.yearSlots(2026);
+eq([T.slotOf(new Date(2026, 0, 1), slots.base), T.slotOf(new Date(2026, 8, 21, 20), slots.base), T.slotOf(new Date(2026, 8, 27), slots.base)],
+    [0, 38, 38], 'cycle start maps to its week slot');
+eq([T.gridYear(new Date(2025, 11, 29, 20)), T.gridYear(new Date(2025, 11, 22)), T.gridYear(new Date(2026, 5, 1))],
+    [2026, 2025, 2026], 'late-December week belongs to the next grid');
+
 print(failures ? `${failures} failure(s)` : 'all tests passed');
 if (failures) System.exit(1);

@@ -1,5 +1,5 @@
 {
-  "name": "AI Usage Limits",
+  "name": "AI Usage Limits (cyberpunk)",
   "uuid": "ai-usage@serboox.github.io",
   "description": "Shows AI service usage limits in the panel. Currently supports Claude; Codex and Gemini support planned.",
   "version": 1,

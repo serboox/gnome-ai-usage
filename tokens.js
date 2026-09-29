@@ -326,3 +326,31 @@ export function shortModelName(model) {
     if (match) return `${match[1]} ${match[2]}${match[3] ? `.${match[3]}` : ''}`;
     return name;
 }
+
+// Week slots of a year, counted from the Monday on or before 1 January.
+export function yearSlots(year) {
+    const base = startOfWeek(new Date(year, 0, 1));
+    const next = new Date(year + 1, 0, 1);
+    return { base, count: Math.ceil((utcDay(next) - utcDay(base)) / DAY_MS / 7) };
+}
+
+const DAY_MS = 24 * 3600 * 1000;
+
+// Calendar-day arithmetic in UTC, so a DST change (a 23- or 25-hour day) never
+// shifts a week into the neighbouring slot.
+function utcDay(date) {
+    return Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+}
+
+export function slotOf(date, base) {
+    const monday = startOfWeek(new Date(date.getFullYear(), date.getMonth(), date.getDate()));
+    return Math.round((utcDay(monday) - utcDay(base)) / DAY_MS / 7);
+}
+
+// The calendar year whose grid holds the week of `date`: a week starting on
+// 29 December belongs to the next year's first slot.
+export function gridYear(date) {
+    const year = date.getFullYear();
+    const monday = startOfWeek(new Date(year, date.getMonth(), date.getDate()));
+    return utcDay(monday) >= utcDay(yearSlots(year + 1).base) ? year + 1 : year;
+}

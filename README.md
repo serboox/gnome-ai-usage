@@ -1,4 +1,4 @@
-# AI Usage Limits — GNOME Shell Extension
+# AI Usage Limits (cyberpunk) — GNOME Shell Extension
 
 A GNOME Shell extension that shows AI service usage limits in the panel, left of the clock. Currently supports Claude; Codex and Gemini support planned.
 
@@ -11,11 +11,11 @@ A GNOME Shell extension that shows AI service usage limits in the panel, left of
 - **Compact time display** — session % · reset countdown · weekly % · weekly reset countdown
   - Supports full range: `2mo5d` · `1d6h` · `3h54m` · `42m` · `↺`
 - **Temporary boost chip** — a bolt plus `+50% · 16d` in the panel while a promotional limit boost is running, in a cool accent so it never reads as a warning
-- **Today's token count** (`Σ257M`) in the panel, next to the limits
+- **Tokens spent in the current session window** after the session percentage and its reset time (`12% · 3h54m · Σ50.5M`), from local transcripts
 - **Popup on click** with two tabs: **LIMITS** (current session + weekly limits per model) and **TOKENS** (token history heatmap)
 - **Auto-refresh** every 30 seconds from `~/.claude/usage.json`
 - **Manual refresh button** (↺) in the popup
-- Segmented neon bars; colors follow usage level: cyan (normal) → yellow (≥50%) → magenta (≥80%)
+- Segmented neon bars; the percentages and bars follow usage on a continuous gradient: green (up to 25%) → yellow (55%) → red (90% and above). Each bar segment keeps the colour of its own position, so a full bar reads as a green-to-red scale
 
 ## Compatibility
 
@@ -171,9 +171,12 @@ current window, e.g. `≈ 47.9M tokens per 1% · 4.41B this cycle`. The window i
 (session) or 7 days (weekly) before `resets_at`; a model-scoped limit ("Fable only") counts only
 that model family. Below 1% the integer utilization is too coarse, so nothing is shown.
 
-**WEEKLY CYCLES** lists the last 8 weekly cycles: tokens spent, the share of the weekly limit
-used, and tokens per 1%. Utilization history comes from two places, because no usage API keeps
-one:
+**WEEKLY CYCLES** is a scrollable list of weekly limits, newest cycle first, one page per year:
+‹ › pages through years and the year chips jump straight to one. Each row shows the week number,
+the cycle's dates, a meter of the share of the weekly limit used (coloured on the same
+green → yellow → red gradient), the tokens spent, tokens per 1% and whether the reading is final. The current cycle is
+marked with a cyan edge. Hovering a row shows its token breakdown. Utilization history comes from
+two places, because no usage API keeps one:
 
 - the usage line the SessionStart hook writes into every transcript
   (`limit=seven_day, utilization=42%, resets in 7484 min (…)`), which reaches back as far as the
@@ -184,9 +187,14 @@ The percent is the highest value seen in the cycle. A finished cycle whose last 
 than a day before its reset is shown as a lower bound (`≥91%`); a cycle with no sample at all has
 its bounds inferred by stepping back 7 days from a known reset and shows tokens only. Tokens come
 from this machine only, so usage on other devices or on claude.ai makes the real cost per percent
-higher than shown. **EXPORT CSV › CYCLES** writes the same table with every token column.
+higher than shown. **EXPORT CSV › CYCLES** writes the same data with every token column.
 
-Tests: `gjs -m tests/tokens.test.js` and `python3 -m unittest discover -s tests`.
+Every computed cycle (weekly and 5-hour sessions) is stored in the `cycles` table of the index, and
+within an unchanged cycle window a recomputation can only raise its stored values (if the window
+itself moved, the new token counts replace the old ones), so the history survives changes to how
+cycles are derived as well as pruned transcripts.
+
+Tests: `gjs -m tests/tokens.test.js`, `gjs -m tests/colors.test.js` and `python3 -m unittest discover -s tests`.
 
 ## fetch-usage.sh
 
